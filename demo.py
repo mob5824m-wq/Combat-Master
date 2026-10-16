@@ -82,6 +82,9 @@ class DemoGateway:
         self.counts: dict[tuple[int, str], int] = {}
         self.posts: list[dict[str, Any]] = []
         self.fail_posts_in: set[int] = set()
+        self.pinned: set[tuple[int, int]] = set()
+        self.deleted: list[tuple[int, int]] = []
+        self.fail_pins = False  # tests set this to simulate missing Manage Messages
 
     # ---- lookups ------------------------------------------------------ #
     def _find(self, guild_id: int) -> Optional[dict[str, Any]]:
@@ -195,6 +198,27 @@ class DemoGateway:
     async def add_reactions(self, guild_id: int, channel_id: int, message_id: int, emojis: list[str]) -> None:
         if (int(channel_id), int(message_id)) not in self.messages:
             raise OperationError("Could not find that message on Discord.")
+
+    async def delete_message(self, guild_id: int, channel_id: int, message_id: int) -> None:
+        key = (int(channel_id), int(message_id))
+        if key in self.messages:  # a message that is already gone counts as deleted
+            del self.messages[key]
+            self.pinned.discard(key)
+            self.deleted.append(key)
+
+    async def pin_message(self, guild_id: int, channel_id: int, message_id: int) -> None:
+        key = (int(channel_id), int(message_id))
+        if self.fail_pins:
+            raise OperationError("Discord would not pin it. Check that I have Manage Messages in that channel.")
+        if key not in self.messages:
+            raise OperationError("Could not find that message on Discord.")
+        self.pinned.add(key)
+
+    async def unpin_message(self, guild_id: int, channel_id: int, message_id: int) -> None:
+        key = (int(channel_id), int(message_id))
+        if key not in self.messages:
+            raise OperationError("Could not find that message on Discord.")
+        self.pinned.discard(key)
 
 
 # --------------------------------------------------------------------------- #

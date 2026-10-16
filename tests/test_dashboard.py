@@ -35,6 +35,9 @@ from dashboard import (  # noqa: E402
     ensure_dashboard_token,
 )
 from demo import DEMO_GUILDS, DemoGateway, demo_config  # noqa: E402
+from audit import Actor  # noqa: E402
+import operations as ops  # noqa: E402
+import settings  # noqa: E402
 
 TOKEN = "test-token-with-enough-length-1234"
 GUILD = str(DEMO_GUILDS[0]["id"])
@@ -343,6 +346,137 @@ class TokenTests(DashboardTestCase):
     def test_server_needs_a_token(self):
         with self.assertRaises(ValueError):
             DashboardServer(self.gw, copy.deepcopy(self.cfg), token="")
+
+
+
+class FeatureRouteTests(DashboardTestCase):
+    """The approval queue, editing and deleting posts, the CSV export and the new settings."""
+
+    def test_approval_round_trip_over_http(self):
+        settings.set_guild_value(self.cfg, int(GUILD), "require_approval", True)
+
+        async def scenario(client):
+            _, body, cookie = await login(client)
+            csrf = body["csrf"]
+            posted = await client.post(
+                f"api/guilds/{GUILD}/announce", json={"message": "Needs a second pair of eyes"},
+                headers=auth_headers(cookie, csrf),
+            )
+            self.assertEqual(posted.status, 200)
+            result = await posted.json()
+            self.assertTrue(result["queued"])
+            request_id = str(result["approval_id"])
+
+            queue = await (await client.get(f"api/guilds/{GUILD}/approvals", headers=auth_headers(cookie))).json()
+            self.assertEqual([row["id"] for row in queue], [request_id])
+            self.assertEqual(queue[0]["payload"]["message"], "Needs a second pair of eyes")
+
+            # The dashboard is one identity, so it can not approve its own request.
+            own = await client.post(
+                f"api/guilds/{GUILD}/approvals/{request_id}/approve", headers=auth_headers(cookie, csrf)
+            )
+            self.assertEqual(own.status, 400)
+            self.assertIn("own request", (await own.json())["error"])
+
+            rejected = await client.post(
+                f"api/guilds/{GUILD}/approvals/{request_id}/reject", headers=auth_headers(cookie, csrf)
+            )
+            self.assertEqual(rejected.status, 200)
+            queue = await (await client.get(f"api/guilds/{GUILD}/approvals", headers=auth_headers(cookie))).json()
+            self.assertEqual(queue, [])
+        self.run_with(scenario)
+
+    def test_a_discord_request_can_be_approved_from_the_dashboard(self):
+        settings.set_guild_value(self.cfg, int(GUILD), "require_approval", True)
+        queued = asyncio.run(ops.announce_now(
+            self.gw, self.cfg, int(GUILD), Actor(43, "Ben", "discord"), message="From Discord"
+        ))
+
+        async def scenario(client):
+            _, body, cookie = await login(client)
+            approved = await client.post(
+                f"api/guilds/{GUILD}/approvals/{queued['approval_id']}/approve",
+                headers=auth_headers(cookie, body["csrf"]),
+            )
+            self.assertEqual(approved.status, 200)
+            self.assertIsNotNone((await approved.json())["jump_url"])
+        self.run_with(scenario)
+        self.assertTrue(any(p["channel_id"] == int(ANNOUNCE) for p in self.gw.posts))
+
+    def test_edit_and_delete_need_the_csrf_header(self):
+        async def scenario(client):
+            _, body, cookie = await login(client)
+            posted = await client.post(
+                f"api/guilds/{GUILD}/announce", json={"message": "Edit me"}, headers=auth_headers(cookie, body["csrf"])
+            )
+            message_id = (await posted.json())["message_id"]
+            url = f"api/guilds/{GUILD}/announcements/{message_id}"
+
+            refused = await client.patch(url, json={"message": "x"}, headers=auth_headers(cookie))
+            self.assertEqual(refused.status, 403)
+
+            edited = await client.patch(
+                url, json={"message": "Edited text", "title": "New heading"}, headers=auth_headers(cookie, body["csrf"])
+            )
+            self.assertEqual(edited.status, 200)
+            self.assertEqual((await edited.json())["body"], "Edited text")
+
+            gone = await client.delete(url, headers=auth_headers(cookie, body["csrf"]))
+            self.assertEqual(gone.status, 200)
+            history = await (await client.get(f"api/guilds/{GUILD}/history", headers=auth_headers(cookie))).json()
+            self.assertNotIn(message_id, [row["message_id"] for row in history])
+        self.run_with(scenario)
+
+    def test_editing_something_the_bot_did_not_post_is_refused(self):
+        async def scenario(client):
+            _, body, cookie = await login(client)
+            response = await client.patch(
+                f"api/guilds/{GUILD}/announcements/123", json={"message": "x"}, headers=auth_headers(cookie, body["csrf"])
+            )
+            self.assertEqual(response.status, 400)
+        self.run_with(scenario)
+
+    def test_audit_export_is_a_csv_download_for_signed_in_staff(self):
+        async def scenario(client):
+            _, body, cookie = await login(client)
+            await client.post(f"api/guilds/{GUILD}/announce", json={"message": "Logged"},
+                              headers=auth_headers(cookie, body["csrf"]))
+            response = await client.get(f"api/guilds/{GUILD}/audit.csv", headers=auth_headers(cookie))
+            self.assertEqual(response.status, 200)
+            self.assertTrue(response.headers["Content-Type"].startswith("text/csv"))
+            self.assertIn("attachment", response.headers["Content-Disposition"])
+            text = await response.text()
+            self.assertTrue(text.startswith("created_at,actor_name,source,action,detail,actor_id"))
+            self.assertIn("announce.post", text)
+
+            client.session.cookie_jar.clear()
+            anonymous = await client.get(f"api/guilds/{GUILD}/audit.csv")
+            self.assertEqual(anonymous.status, 401)
+        self.run_with(scenario)
+
+    def test_settings_carry_the_new_keys_and_refuse_half_a_quiet_window(self):
+        async def scenario(client):
+            _, body, cookie = await login(client)
+            headers = auth_headers(cookie, body["csrf"])
+            current = await (await client.get(f"api/guilds/{GUILD}/settings", headers=auth_headers(cookie))).json()
+            for key in ("require_approval", "quiet_start", "quiet_end"):
+                self.assertIn(key, current)
+
+            half = await client.put(
+                f"api/guilds/{GUILD}/settings", json={"quiet_start": "22:00"}, headers=headers
+            )
+            self.assertEqual(half.status, 400)
+
+            saved = await client.put(
+                f"api/guilds/{GUILD}/settings",
+                json={"quiet_start": "22:00", "quiet_end": "08:00", "require_approval": True},
+                headers=headers,
+            )
+            self.assertEqual(saved.status, 200)
+            result = await saved.json()
+            self.assertEqual((result["quiet_start"], result["quiet_end"], result["require_approval"]),
+                             ("22:00", "08:00", True))
+        self.run_with(scenario)
 
 
 if __name__ == "__main__":

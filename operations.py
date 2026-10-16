@@ -21,9 +21,12 @@ from typing import Any, Optional, Protocol
 import discord
 
 import announcements as ann
+import approvals
 import audit
 import events
+import pins
 import polls
+import quiet
 import settings
 import welcome
 from audit import Actor, SCHEDULER_ACTOR
@@ -80,6 +83,15 @@ class Gateway(Protocol):
         """User ids who added the emoji, bots excluded."""
 
     async def add_reactions(self, guild_id: int, channel_id: int, message_id: int, emojis: list[str]) -> None:
+        ...
+
+    async def delete_message(self, guild_id: int, channel_id: int, message_id: int) -> None:
+        """Delete a message. A message that is already gone counts as deleted."""
+
+    async def pin_message(self, guild_id: int, channel_id: int, message_id: int) -> None:
+        ...
+
+    async def unpin_message(self, guild_id: int, channel_id: int, message_id: int) -> None:
         ...
 
 
@@ -164,6 +176,143 @@ def _persist(cfg: dict) -> None:
 # --------------------------------------------------------------------------- #
 # Announcements
 # --------------------------------------------------------------------------- #
+def _message_id(value: Any) -> int:
+    try:
+        return int(str(value).strip())
+    except (TypeError, ValueError):
+        raise OperationError("That is not a message ID. Copy the ID of the announcement message.") from None
+
+
+def _same_person(a: Actor, b: Actor) -> bool:
+    return a.source == b.source and int(a.id) == int(b.id)
+
+
+async def _pin(
+    gw: Gateway, guild_id: int, channel_id: int, message_id: int, seconds: int, now: datetime
+) -> tuple[Optional[str], list[str]]:
+    """Pin a posted message and remember when to unpin it. Returns (unpin time, warnings)."""
+    try:
+        await gw.pin_message(guild_id, channel_id, message_id)
+    except Exception as exc:  # the post itself went out, so this is a warning, not a failure
+        return None, [f"Posted, but could not pin it: {(str(exc) or type(exc).__name__)[:300]}"]
+    until = now + timedelta(seconds=seconds)
+    pins.add(guild_id=guild_id, channel_id=channel_id, message_id=message_id, unpin_at=until, now=now)
+    return ann.iso_utc(until), []
+
+
+async def _post_announcement(
+    gw: Gateway,
+    cfg: dict,
+    guild_id: int,
+    actor: Actor,
+    *,
+    message: str,
+    title: str,
+    channel_id: int,
+    mention_role_id: Optional[int],
+    publish: bool,
+    pin_seconds: Optional[int],
+    now: Optional[datetime],
+    approved_by: Optional[Actor] = None,
+) -> dict[str, Any]:
+    """Post an announcement now and record it. Used by staff posts and approved requests."""
+    now = _now(now)
+    embed = ann.build_announcement_embed(title=title, body=message, author_name=actor.name)
+    sent = await gw.post(
+        guild_id,
+        channel_id,
+        embed=embed,
+        content=ann.mention_content(mention_role_id),
+        role_id=mention_role_id,
+        publish=publish,
+    )
+    ann.record_announcement(
+        guild_id=guild_id,
+        channel_id=channel_id,
+        message_id=sent["message_id"],
+        author_id=actor.id,
+        author_name=actor.name,
+        title=title,
+        body=message,
+        mention_role_id=mention_role_id,
+        source="now",
+        when=now,
+    )
+    warnings = _warnings(gw, guild_id, mention_role_id, sent.get("published") if publish else None)
+    pinned_until: Optional[str] = None
+    if pin_seconds:
+        pinned_until, pin_warnings = await _pin(gw, guild_id, channel_id, sent["message_id"], pin_seconds, now)
+        warnings += pin_warnings
+    detail = f"#{channel_id}: {title}"
+    if approved_by is not None:
+        detail += f" (approved by {approved_by.name})"
+    audit.record(guild_id, actor, "announce.post", detail)
+    await _log(
+        gw,
+        cfg,
+        guild_id,
+        ann.build_staff_log_embed(
+            heading="Announcement posted",
+            channel_mention=f"<#{channel_id}>",
+            author_mention=_actor_mention(actor),
+            title=title,
+            body=message,
+            mention=ann.mention_content(mention_role_id),
+            source="Now" if approved_by is None else f"Approved by {approved_by.name}",
+        ),
+    )
+    return {
+        "message_id": str(sent["message_id"]),
+        "jump_url": sent.get("jump_url"),
+        "channel_id": channel_id,
+        "published": bool(sent.get("published")),
+        "pinned_until": pinned_until,
+        "warnings": warnings,
+    }
+
+
+def _approval_summary(text: str, channel_id: int, when: str = "") -> str:
+    """One line for the approval queue: what it is, where it goes, and when."""
+    preview = " ".join(str(text or "").split())
+    if len(preview) > 80:
+        preview = preview[:79] + "…"
+    prefix = f"{when}, " if when else ""
+    return f"{prefix}channel {channel_id}: {preview}"
+
+
+async def _queue(
+    gw: Gateway,
+    cfg: dict,
+    guild_id: int,
+    actor: Actor,
+    kind: str,
+    details: dict[str, Any],
+    *,
+    summary: str,
+    now: datetime,
+) -> dict[str, Any]:
+    """Hold an announcement for approval and tell the staff log it is waiting."""
+    request_id = approvals.create(
+        guild_id=guild_id, kind=kind, payload=details, summary=summary, requester=actor, now=now
+    )
+    audit.record(guild_id, actor, "approval.request", f"#{request_id} ({kind}) {summary}")
+    await _log(
+        gw,
+        cfg,
+        guild_id,
+        ann.build_staff_log_embed(
+            heading="Announcement waiting for approval",
+            channel_mention=f"<#{details['channel_id']}>",
+            author_mention=_actor_mention(actor),
+            title=details.get("title") or "",
+            body=details["message"],
+            mention=ann.mention_content(details.get("mention_role_id")),
+            source=f"Request #{request_id}: approve it with /manage approve",
+        ),
+    )
+    return {"queued": True, "approval_id": request_id, "warnings": []}
+
+
 @_user_errors
 async def announce_now(
     gw: Gateway,
@@ -176,53 +325,71 @@ async def announce_now(
     channel_id: Optional[int] = None,
     mention_role_id: Optional[int] = None,
     publish: bool = False,
+    pin_for: Optional[str] = None,
     now: Optional[datetime] = None,
 ) -> dict[str, Any]:
-    body = ann.clean_body(message)
-    heading = ann.clean_title(title)
-    target = _require_channel(gw, cfg, guild_id, channel_id)
-    embed = ann.build_announcement_embed(title=heading, body=body, author_name=actor.name)
-    sent = await gw.post(
-        guild_id,
-        target,
-        embed=embed,
-        content=ann.mention_content(mention_role_id),
-        role_id=mention_role_id,
-        publish=publish,
-    )
-    ann.record_announcement(
+    """Post an announcement now, or hold it for approval when the server requires that."""
+    now = _now(now)
+    details: dict[str, Any] = {
+        "message": ann.clean_body(message),
+        "title": ann.clean_title(title),
+        "channel_id": _require_channel(gw, cfg, guild_id, channel_id),
+        "mention_role_id": int(mention_role_id) if mention_role_id else None,
+        "publish": bool(publish),
+        "pin_seconds": ann.parse_pin(pin_for),
+    }
+    if settings.get_require_approval(cfg, guild_id):
+        return await _queue(
+            gw,
+            cfg,
+            guild_id,
+            actor,
+            approvals.KIND_ANNOUNCE,
+            details,
+            summary=_approval_summary(details.get("title") or details["message"], details["channel_id"]),
+            now=now,
+        )
+    return await _post_announcement(gw, cfg, guild_id, actor, now=now, **details)
+
+
+def _create_schedule(
+    gw: Gateway,
+    guild_id: int,
+    actor: Actor,
+    details: dict[str, Any],
+    *,
+    now: datetime,
+    approved_by: Optional[Actor] = None,
+) -> dict[str, Any]:
+    send_at = ann.parse_stored(details["send_at"])
+    interval = details.get("interval_seconds")
+    target = int(details["channel_id"])
+    schedule_id = ann.add_scheduled(
         guild_id=guild_id,
         channel_id=target,
-        message_id=sent["message_id"],
         author_id=actor.id,
         author_name=actor.name,
-        title=heading,
-        body=body,
-        mention_role_id=mention_role_id,
-        source="now",
-        when=_now(now),
+        title=details["title"],
+        body=details["message"],
+        mention_role_id=details.get("mention_role_id"),
+        send_at=send_at,
+        publish=bool(details.get("publish")),
+        interval_seconds=interval,
+        pin_seconds=details.get("pin_seconds"),
+        now=now,
     )
-    audit.record(guild_id, actor, "announce.post", f"#{target}: {heading}")
-    await _log(
-        gw,
-        cfg,
-        guild_id,
-        ann.build_staff_log_embed(
-            heading="Announcement posted",
-            channel_mention=f"<#{target}>",
-            author_mention=_actor_mention(actor),
-            title=heading,
-            body=body,
-            mention=ann.mention_content(mention_role_id),
-            source="Now",
-        ),
-    )
+    kind = "repeat.create" if interval else "schedule.create"
+    detail = f"#{schedule_id} for {ann.iso_utc(send_at)} in #{target}"
+    if approved_by is not None:
+        detail += f" (approved by {approved_by.name})"
+    audit.record(guild_id, actor, kind, detail)
     return {
-        "message_id": str(sent["message_id"]),
-        "jump_url": sent.get("jump_url"),
+        "id": schedule_id,
+        "send_at": ann.iso_utc(send_at),
+        "repeat_seconds": interval,
         "channel_id": target,
-        "published": bool(sent.get("published")),
-        "warnings": _warnings(gw, guild_id, mention_role_id, sent.get("published") if publish else None),
+        "pinned": bool(details.get("pin_seconds")),
+        "warnings": _warnings(gw, guild_id, details.get("mention_role_id")),
     }
 
 
@@ -240,6 +407,7 @@ async def schedule_announcement(
     mention_role_id: Optional[int] = None,
     publish: bool = False,
     repeat_every: Optional[str] = None,
+    pin_for: Optional[str] = None,
     now: Optional[datetime] = None,
 ) -> dict[str, Any]:
     """Schedule one announcement, or a repeating one when ``repeat_every`` is set."""
@@ -248,29 +416,144 @@ async def schedule_announcement(
     heading = ann.clean_title(title)
     send_at = ann.parse_send_time(when, now, settings.get_timezone_name(cfg, guild_id))
     interval = ann.parse_interval(repeat_every) if repeat_every else None
+    pin_seconds = ann.parse_pin(pin_for)
+    if pin_seconds and interval:
+        raise ValueError("Repeating announcements can not be pinned. Schedule a one-off post to pin it.")
     target = _require_channel(gw, cfg, guild_id, channel_id)
-    schedule_id = ann.add_scheduled(
-        guild_id=guild_id,
-        channel_id=target,
-        author_id=actor.id,
-        author_name=actor.name,
-        title=heading,
-        body=body,
-        mention_role_id=mention_role_id,
-        send_at=send_at,
-        publish=publish,
-        interval_seconds=interval,
-        now=now,
-    )
-    kind = "repeat.create" if interval else "schedule.create"
-    audit.record(guild_id, actor, kind, f"#{schedule_id} for {ann.iso_utc(send_at)} in #{target}")
-    return {
-        "id": schedule_id,
+    details: dict[str, Any] = {
+        # Stored as an absolute time, so a request that waits in the queue keeps its meaning.
         "send_at": ann.iso_utc(send_at),
-        "repeat_seconds": interval,
+        "message": body,
+        "title": heading,
         "channel_id": target,
-        "warnings": _warnings(gw, guild_id, mention_role_id),
+        "mention_role_id": int(mention_role_id) if mention_role_id else None,
+        "publish": bool(publish),
+        "interval_seconds": interval,
+        "pin_seconds": pin_seconds,
     }
+    if settings.get_require_approval(cfg, guild_id):
+        return await _queue(
+            gw,
+            cfg,
+            guild_id,
+            actor,
+            approvals.KIND_SCHEDULE,
+            details,
+            summary=_approval_summary(
+                heading or details["message"],
+                target,
+                when=f"{'repeats' if interval else 'once'} at {ann.iso_utc(send_at)}",
+            ),
+            now=now,
+        )
+    return _create_schedule(gw, guild_id, actor, details, now=now)
+
+
+# --------------------------------------------------------------------------- #
+# Audit export
+# --------------------------------------------------------------------------- #
+def export_audit_csv(guild_id: int) -> str:
+    """The whole audit log for one server as CSV text, oldest first."""
+    return audit.to_csv(guild_id)
+
+
+# --------------------------------------------------------------------------- #
+# Approval queue
+# --------------------------------------------------------------------------- #
+def list_approvals(guild_id: int) -> list[dict[str, Any]]:
+    return approvals.list_pending(guild_id)
+
+
+@_user_errors
+async def approve_request(
+    gw: Gateway, cfg: dict, guild_id: int, approver: Actor, request_id: int, *, now: Optional[datetime] = None
+) -> dict[str, Any]:
+    """Approve a waiting announcement. It goes out under the requester's name."""
+    now = _now(now)
+    row = approvals.get(guild_id, request_id)
+    if row is None or row["status"] != approvals.PENDING:
+        raise OperationError(f"There is no pending request #{request_id} in this server. Check the approval queue.")
+    requester = approvals.requester_of(row)
+    if _same_person(requester, approver):
+        raise OperationError("You can't approve your own request. Ask another staff member to approve it.")
+    payload = row["payload"]
+    if row["kind"] == approvals.KIND_SCHEDULE and ann.parse_stored(payload["send_at"]) - now < ann.MIN_SCHEDULE_AHEAD:
+        raise OperationError("That time has already passed. Reject this request and schedule it again.")
+    if not approvals.decide(guild_id, request_id, approvals.APPROVED, approver, now=now):
+        raise OperationError(f"Request #{request_id} was just decided by someone else.")
+    try:
+        if row["kind"] == approvals.KIND_ANNOUNCE:
+            result = await _post_announcement(
+                gw, cfg, guild_id, requester, now=now, approved_by=approver, **payload
+            )
+        else:
+            result = _create_schedule(gw, guild_id, requester, payload, now=now, approved_by=approver)
+    except Exception:
+        approvals.reopen(guild_id, request_id)  # nothing went out, so it stays in the queue
+        raise
+    audit.record(guild_id, approver, "approval.approve", f"#{request_id} ({row['kind']}) by {requester.name}")
+    result["request_id"] = request_id
+    return result
+
+
+@_user_errors
+async def reject_request(guild_id: int, actor: Actor, request_id: int, *, now: Optional[datetime] = None) -> None:
+    row = approvals.get(guild_id, request_id)
+    if row is None or row["status"] != approvals.PENDING:
+        raise OperationError(f"There is no pending request #{request_id} in this server. Check the approval queue.")
+    if not approvals.decide(guild_id, request_id, approvals.REJECTED, actor, now=now):
+        raise OperationError(f"Request #{request_id} was just decided by someone else.")
+    audit.record(guild_id, actor, "approval.reject", f"#{request_id} ({row['kind']}) by {row['requester_name']}")
+
+
+# --------------------------------------------------------------------------- #
+# Editing and deleting what was posted
+# --------------------------------------------------------------------------- #
+def _recorded(guild_id: int, message_id: int) -> dict[str, Any]:
+    row = ann.get_announcement(guild_id, message_id)
+    if row is None:
+        raise OperationError(
+            "That message is not an announcement the bot recorded in this server, so it can not be changed here."
+        )
+    return row
+
+
+@_user_errors
+async def edit_announcement(
+    gw: Gateway,
+    cfg: dict,
+    guild_id: int,
+    actor: Actor,
+    *,
+    message_id: Any,
+    message: Optional[str] = None,
+    title: Optional[str] = None,
+    now: Optional[datetime] = None,
+) -> dict[str, Any]:
+    """Change the text or heading of an announcement the bot posted. Leave one out to keep it."""
+    if message is None and title is None:
+        raise ValueError("Give a new message, a new heading, or both.")
+    mid = _message_id(message_id)
+    row = _recorded(guild_id, mid)
+    body = ann.clean_body(message) if message is not None else row["body"]
+    heading = ann.clean_title(title) if title is not None else row["title"]
+    embed = ann.build_announcement_embed(title=heading, body=body, author_name=row["author_name"] or "staff")
+    await gw.edit_embed(guild_id, int(row["channel_id"]), mid, embed)
+    ann.update_announcement(row["id"], title=heading, body=body, now=_now(now))
+    audit.record(guild_id, actor, "announce.edit", f"message {mid} in #{row['channel_id']}: {heading}")
+    return {"message_id": str(mid), "channel_id": int(row["channel_id"]), "title": heading, "body": body}
+
+
+@_user_errors
+async def delete_announcement(
+    gw: Gateway, cfg: dict, guild_id: int, actor: Actor, *, message_id: Any, now: Optional[datetime] = None
+) -> None:
+    mid = _message_id(message_id)
+    row = _recorded(guild_id, mid)
+    await gw.delete_message(guild_id, int(row["channel_id"]), mid)  # already gone counts as deleted
+    ann.mark_announcement_deleted(row["id"], _now(now))
+    pins.close_for_message(guild_id, mid)
+    audit.record(guild_id, actor, "announce.delete", f"message {mid} in #{row['channel_id']}: {row['title']}")
 
 
 def cancel_schedule(guild_id: int, actor: Actor, schedule_id: int) -> None:
@@ -608,45 +891,81 @@ SETTING_FIELDS = (
     "timezone",
     "welcome_channel_id",
     "welcome_message",
+    "require_approval",
+    "quiet_start",
+    "quiet_end",
 )
+
+
+def _is_blank(value: Any) -> bool:
+    if value is None:
+        return True
+    if isinstance(value, bool):
+        return False
+    if isinstance(value, str):
+        return value.strip() == ""
+    return isinstance(value, int) and value == 0
+
+
+def _as_flag(value: Any) -> bool:
+    if isinstance(value, str):
+        return value.strip().lower() in ("1", "true", "yes", "on")
+    return bool(value)
+
+
+def _clean_setting(gw: Gateway, guild_id: int, key: str, value: Any) -> Any:
+    if key == "require_approval":
+        return _as_flag(value)
+    if _is_blank(value):
+        value = None
+    if key == "timezone" and value:
+        return ann.validate_timezone(str(value))
+    if key == "welcome_message" and value:
+        return welcome.clean_template(str(value))
+    if key in ("quiet_start", "quiet_end") and value:
+        return quiet.parse_clock(str(value))
+    if key.endswith("_id") and value is not None:
+        value = int(value)
+        if key in ("announcement_channel_id", "staff_channel_id", "welcome_channel_id"):
+            problem = gw.channel_problem(guild_id, value)
+            if problem:
+                raise OperationError(problem)
+    return value
 
 
 @_user_errors
 async def update_settings(gw: Gateway, cfg: dict, guild_id: int, actor: Actor, changes: dict[str, Any]) -> dict[str, Any]:
     """Apply the given settings for one server. ``None`` clears a value."""
-    applied = {}
+    cleaned: dict[str, Any] = {}
     for key, value in changes.items():
         if key not in SETTING_FIELDS:
             raise ValueError(f"Unknown setting `{key}`.")
-        if value in ("", 0):
-            value = None
-        if key == "timezone" and value:
-            value = ann.validate_timezone(str(value))
-        if key == "welcome_message" and value:
-            value = welcome.clean_template(str(value))
-        if key.endswith("_id") and value is not None:
-            value = int(value)
-            if key in ("announcement_channel_id", "staff_channel_id", "welcome_channel_id"):
-                problem = gw.channel_problem(guild_id, value)
-                if problem:
-                    raise OperationError(problem)
+        cleaned[key] = _clean_setting(gw, guild_id, key, value)
+    if "quiet_start" in cleaned or "quiet_end" in cleaned:
+        current_start, current_end = settings.get_quiet_hours(cfg, guild_id)
+        start = cleaned.get("quiet_start", current_start)
+        end = cleaned.get("quiet_end", current_end)
+        cleaned["quiet_start"], cleaned["quiet_end"] = quiet.validate_pair(start, end)
+    for key, value in cleaned.items():
         settings.set_guild_value(cfg, guild_id, key, value)
-        applied[key] = value
     _persist(cfg)
-    audit.record(guild_id, actor, "settings.update", ", ".join(sorted(applied)))
-    return applied
+    audit.record(guild_id, actor, "settings.update", ", ".join(sorted(cleaned)))
+    return cleaned
 
 
 # --------------------------------------------------------------------------- #
 # The scheduler
 # --------------------------------------------------------------------------- #
 async def run_scheduler(gw: Gateway, cfg: dict, *, now: Optional[datetime] = None) -> dict[str, int]:
-    """Do everything that is due: scheduled posts, poll closes, event reminders."""
+    """Do everything that is due: scheduled posts, unpins, poll closes, event reminders."""
     now = _now(now)
-    counts = {"posted": 0, "failed": 0, "polls_closed": 0, "reminders": 0}
+    counts = {"posted": 0, "failed": 0, "deferred": 0, "unpinned": 0, "polls_closed": 0, "reminders": 0}
 
     for row in ann.list_due_scheduled(now):
         await _run_scheduled(gw, cfg, row, now, counts)
+
+    for pin in pins.list_due(now):
+        await _unpin(gw, pin, counts)
 
     for poll in polls.list_due_polls(now):
         try:
@@ -661,11 +980,34 @@ async def run_scheduler(gw: Gateway, cfg: dict, *, now: Optional[datetime] = Non
     return counts
 
 
+async def _unpin(gw: Gateway, pin: dict[str, Any], counts: dict[str, int]) -> None:
+    guild_id, channel_id, message_id = int(pin["guild_id"]), int(pin["channel_id"]), int(pin["message_id"])
+    try:
+        await gw.unpin_message(guild_id, channel_id, message_id)
+    except Exception as exc:
+        reason = (str(exc) or type(exc).__name__)[:500]
+        pins.mark(pin["id"], pins.FAILED, reason)
+        logger.warning("Could not unpin message %s in %s: %s", message_id, channel_id, reason)
+        return
+    pins.mark(pin["id"], pins.UNPINNED)
+    counts["unpinned"] += 1
+    audit.record(guild_id, SCHEDULER_ACTOR, "pin.expire", f"message {message_id} in #{channel_id}")
+
+
 async def _run_scheduled(gw: Gateway, cfg: dict, row: dict[str, Any], now: datetime, counts: dict[str, int]) -> None:
     guild_id = int(row["guild_id"])
     channel_id = int(row["channel_id"])
     repeating = row["interval_seconds"] is not None
     source = "repeat" if repeating else "scheduled"
+
+    # Quiet hours: an announcement due inside the window waits for it to end.
+    held_until = quiet.window_end(now, settings.get_timezone_name(cfg, guild_id), *settings.get_quiet_hours(cfg, guild_id))
+    if held_until is not None:
+        ann.set_send_at(row["id"], held_until)
+        counts["deferred"] += 1
+        audit.record(guild_id, SCHEDULER_ACTOR, "schedule.hold", f"#{row['id']} until {ann.iso_utc(held_until)}")
+        return
+
     author = row["author_name"] or "staff"
     error: Optional[str] = None
     try:
@@ -673,7 +1015,7 @@ async def _run_scheduled(gw: Gateway, cfg: dict, row: dict[str, Any], now: datet
         if problem:
             raise OperationError(problem)
         embed = ann.build_announcement_embed(title=row["title"], body=row["body"], author_name=author)
-        await gw.post(
+        sent = await gw.post(
             guild_id,
             channel_id,
             embed=embed,
@@ -684,7 +1026,7 @@ async def _run_scheduled(gw: Gateway, cfg: dict, row: dict[str, Any], now: datet
         ann.record_announcement(
             guild_id=guild_id,
             channel_id=channel_id,
-            message_id=None,
+            message_id=sent["message_id"],
             author_id=row["author_id"],
             author_name=author,
             title=row["title"],
@@ -709,6 +1051,15 @@ async def _run_scheduled(gw: Gateway, cfg: dict, row: dict[str, Any], now: datet
                 source=f"Schedule #{row['id']}",
             ),
         )
+        if row.get("pin_seconds") and not repeating:
+            _, pin_warnings = await _pin(gw, guild_id, channel_id, sent["message_id"], int(row["pin_seconds"]), now)
+            for note in pin_warnings:
+                await _log(
+                    gw,
+                    cfg,
+                    guild_id,
+                    _failure_embed("Could not pin a scheduled announcement", note, channel_id, f"Schedule #{row['id']}"),
+                )
     except Exception as exc:
         error = (str(exc) or type(exc).__name__)[: ann.ERROR_TEXT_LIMIT]
         counts["failed"] += 1
@@ -764,5 +1115,7 @@ def overview(cfg: dict, guild_id: int, *, now: Optional[datetime] = None) -> dic
         "polls_open": len(polls.list_polls(guild_id, open_only=True)),
         "events_upcoming": len(events.list_upcoming(guild_id, _now(now), limit=100)),
         "welcome_enabled": settings.get_welcome_channel_id(cfg, guild_id) is not None,
+        "approvals_pending": len(approvals.list_pending(guild_id)),
+        "pins_active": len(pins.list_active(guild_id)),
         "recent": ann.list_history(guild_id, 5),
     }

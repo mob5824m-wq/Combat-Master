@@ -65,6 +65,9 @@ DEFAULT_GUILD: dict[str, Any] = {
     "timezone": None,  # None -> the config-wide default_timezone
     "welcome_channel_id": None,
     "welcome_message": None,  # None -> the built-in welcome text
+    "require_approval": False,  # True -> announcements wait for another staff member
+    "quiet_start": None,  # "HH:MM" in the server's timezone; None with quiet_end -> off
+    "quiet_end": None,
 }
 
 # Keys a dashboard or command may change, and the type each one takes.
@@ -149,6 +152,15 @@ def get_staff_channel_id(cfg: dict[str, Any], guild_id: int) -> Optional[int]:
 
 def get_welcome_channel_id(cfg: dict[str, Any], guild_id: int) -> Optional[int]:
     return _as_id(get_guild_config(cfg, guild_id)["welcome_channel_id"])
+
+
+def get_require_approval(cfg: dict[str, Any], guild_id: int) -> bool:
+    return bool(get_guild_config(cfg, guild_id)["require_approval"])
+
+
+def get_quiet_hours(cfg: dict[str, Any], guild_id: int) -> tuple[Optional[str], Optional[str]]:
+    entry = get_guild_config(cfg, guild_id)
+    return entry["quiet_start"] or None, entry["quiet_end"] or None
 
 
 def get_timezone_name(cfg: dict[str, Any], guild_id: int) -> str:

@@ -11,6 +11,8 @@ Everything staff use is reached through one slash-command group, ``/manage``:
       /manage cancel          cancel a scheduled or repeating announcement
       /manage history         recent announcements
       /manage template ...    save, list, delete and use reusable text
+      /manage edit            change the text of a post the bot made
+      /manage delete          delete a post the bot made
 
     Polls and events
       /manage poll ...        create, list and close reaction polls
@@ -18,6 +20,12 @@ Everything staff use is reached through one slash-command group, ``/manage``:
 
     Members
       /manage welcome ...     set, turn off or test the welcome message
+
+    Approval and quiet hours
+      /manage queue           announcements waiting for a second staff member
+      /manage approve         approve a queued announcement
+      /manage reject          turn a queued announcement down
+      /manage quiet           set or clear the quiet hours
 
     Server
       /manage status          settings, counts and the next thing due
@@ -227,6 +235,13 @@ def _warn_lines(warnings: list[str]) -> list[str]:
     return [f"⚠️ {w}" for w in warnings]
 
 
+def _queued_text(result: dict[str, Any]) -> str:
+    return (
+        f"Sent to the approval queue as **#{result['approval_id']}**. A different staff member can "
+        "approve it with `/manage approve` and that number."
+    )
+
+
 # --------------------------------------------------------------------------- #
 # Nested groups. Defined at module level, attached to /manage, and bound by the cog below.
 # --------------------------------------------------------------------------- #
@@ -286,6 +301,7 @@ class CombatMasterCog(commands.Cog):
         channel="Where to post. Defaults to the server's announcement channel.",
         mention="Optional role to ping with it.",
         publish="Also publish to followers (announcement channels only).",
+        pin_for="Pin it for this long, e.g. 24h. It is unpinned automatically.",
     )
     async def manage_announce(
         self,
@@ -295,6 +311,7 @@ class CombatMasterCog(commands.Cog):
         channel: Optional[discord.TextChannel] = None,
         mention: Optional[discord.Role] = None,
         publish: bool = False,
+        pin_for: Optional[app_commands.Range[str, 1, 20]] = None,
     ) -> None:
         if not await self._staff(interaction):
             return
@@ -309,13 +326,19 @@ class CombatMasterCog(commands.Cog):
                 channel_id=channel.id if channel else None,
                 mention_role_id=mention.id if mention else None,
                 publish=publish,
+                pin_for=pin_for,
             )
         except OperationError as exc:
             await self._reply(interaction, str(exc))
             return
+        if result.get("queued"):
+            await self._reply(interaction, _queued_text(result))
+            return
         lines = [f"Posted in <#{result['channel_id']}>: {result['jump_url']}"]
         if publish and result["published"]:
             lines.append("Published to followers.")
+        if result.get("pinned_until"):
+            lines.append(f"Pinned until {_when_text(result['pinned_until'])}.")
         await self._reply(interaction, "\n".join(lines + _warn_lines(result["warnings"])))
 
     @manage_group.command(name="schedule", description="Post an announcement at a later time.")
@@ -326,6 +349,7 @@ class CombatMasterCog(commands.Cog):
         channel="Where to post. Defaults to the server's announcement channel.",
         mention="Optional role to ping when it is posted.",
         publish="Also publish to followers (announcement channels only).",
+        pin_for="Pin it for this long once posted, e.g. 24h. Unpinned automatically.",
     )
     async def manage_schedule(
         self,
@@ -336,10 +360,11 @@ class CombatMasterCog(commands.Cog):
         channel: Optional[discord.TextChannel] = None,
         mention: Optional[discord.Role] = None,
         publish: bool = False,
+        pin_for: Optional[app_commands.Range[str, 1, 20]] = None,
     ) -> None:
         if not await self._staff(interaction):
             return
-        await self._schedule(interaction, when, message, title, channel, mention, publish, None)
+        await self._schedule(interaction, when, message, title, channel, mention, publish, None, pin_for)
 
     @manage_group.command(name="repeat", description="Post an announcement again and again, on a schedule.")
     @app_commands.describe(
@@ -364,9 +389,11 @@ class CombatMasterCog(commands.Cog):
     ) -> None:
         if not await self._staff(interaction):
             return
-        await self._schedule(interaction, first_in or every, message, title, channel, mention, publish, every)
+        await self._schedule(interaction, first_in or every, message, title, channel, mention, publish, every, None)
 
-    async def _schedule(self, interaction, when, message, title, channel, mention, publish, repeat_every) -> None:
+    async def _schedule(
+        self, interaction, when, message, title, channel, mention, publish, repeat_every, pin_for=None
+    ) -> None:
         try:
             result = await ops.schedule_announcement(
                 self.bot.gateway,
@@ -380,9 +407,13 @@ class CombatMasterCog(commands.Cog):
                 mention_role_id=mention.id if mention else None,
                 publish=publish,
                 repeat_every=repeat_every,
+                pin_for=pin_for,
             )
         except OperationError as exc:
             await self._reply(interaction, str(exc))
+            return
+        if result.get("queued"):
+            await self._reply(interaction, _queued_text(result))
             return
         if result["repeat_seconds"]:
             text = (
@@ -394,6 +425,8 @@ class CombatMasterCog(commands.Cog):
                 f"Scheduled **#{result['id']}** for {_when_text(result['send_at'])} "
                 f"in <#{result['channel_id']}>. Cancel it with `/manage cancel` and that number."
             )
+            if result.get("pinned"):
+                text += " It will be pinned when it posts."
         await self._reply(interaction, "\n".join([text] + _warn_lines(result["warnings"])))
 
     @manage_group.command(name="scheduled", description="List announcements waiting to be posted.")
@@ -537,6 +570,9 @@ class CombatMasterCog(commands.Cog):
             )
         except OperationError as exc:
             await self._reply(interaction, str(exc))
+            return
+        if result.get("queued"):
+            await self._reply(interaction, _queued_text(result))
             return
         await self._reply(
             interaction,
@@ -766,6 +802,14 @@ class CombatMasterCog(commands.Cog):
             inline=True,
         )
         embed.add_field(name="Templates", value=str(data["templates"]), inline=True)
+        embed.add_field(
+            name="Approval queue",
+            value=f"{'On' if cfg['require_approval'] else 'Off'} · {data['approvals_pending']} waiting",
+            inline=True,
+        )
+        quiet_start, quiet_end = settings.get_quiet_hours(self.bot.config, guild_id)
+        embed.add_field(name="Quiet hours", value=f"{quiet_start} to {quiet_end}" if quiet_start else "Off", inline=True)
+        embed.add_field(name="Pinned", value=str(data["pins_active"]), inline=True)
         await self._reply(interaction, embed=embed)
 
     @manage_group.command(name="audit", description="Show recent staff actions, newest first.")
@@ -784,12 +828,156 @@ class CombatMasterCog(commands.Cog):
         embed = discord.Embed(title="Recent staff actions", description="\n".join(lines)[:4000], color=ann.EMBED_COLOR)
         await self._reply(interaction, embed=embed)
 
+    # ================================================================== #
+    # Approvals, editing and deleting, quiet hours
+    # ================================================================== #
+    @manage_group.command(name="queue", description="List announcements waiting for approval.")
+    async def manage_queue(self, interaction: discord.Interaction) -> None:
+        if not await self._staff(interaction):
+            return
+        pending = ops.list_approvals(interaction.guild_id)
+        if not pending:
+            await self._reply(interaction, "Nothing is waiting for approval.")
+            return
+        lines = [
+            f"**#{row['id']}** · {row['kind']} · requested by {row['requester_name']} · "
+            f"{_when_text(row['created_at'])} · {row['summary']}"
+            for row in pending[:25]
+        ]
+        if len(pending) > 25:
+            lines.append(f"...and {len(pending) - 25} more.")
+        embed = discord.Embed(title="Waiting for approval", description="\n".join(lines)[:4000], color=ann.EMBED_COLOR)
+        embed.set_footer(text="Approve with /manage approve, or turn one down with /manage reject.")
+        await self._reply(interaction, embed=embed)
+
+    @manage_group.command(name="approve", description="Approve an announcement waiting in the queue.")
+    @app_commands.describe(request_id="The number shown by /manage queue.")
+    async def manage_approve(
+        self, interaction: discord.Interaction, request_id: app_commands.Range[int, 1, 2_000_000_000]
+    ) -> None:
+        if not await self._staff(interaction):
+            return
+        try:
+            result = await ops.approve_request(
+                self.bot.gateway, self.bot.config, interaction.guild_id, _actor(interaction), request_id
+            )
+        except OperationError as exc:
+            await self._reply(interaction, str(exc))
+            return
+        lines = [f"Approved **#{request_id}**."]
+        if result.get("jump_url"):
+            lines.append(f"Posted: {result['jump_url']}")
+        if result.get("send_at"):
+            lines.append(f"Scheduled for {_when_text(result['send_at'])}.")
+        await self._reply(interaction, "\n".join(lines + _warn_lines(result.get("warnings", []))))
+
+    @manage_group.command(name="reject", description="Turn down an announcement waiting in the queue.")
+    @app_commands.describe(request_id="The number shown by /manage queue.")
+    async def manage_reject(
+        self, interaction: discord.Interaction, request_id: app_commands.Range[int, 1, 2_000_000_000]
+    ) -> None:
+        if not await self._staff(interaction):
+            return
+        try:
+            await ops.reject_request(interaction.guild_id, _actor(interaction), request_id)
+        except OperationError as exc:
+            await self._reply(interaction, str(exc))
+            return
+        await self._reply(interaction, f"Turned down **#{request_id}**.")
+
+    @manage_group.command(name="edit", description="Change the text of an announcement the bot posted.")
+    @app_commands.describe(
+        message_id="The message's ID. Right-click it and choose Copy Message ID.",
+        message="New text. Leave out to keep the current text.",
+        title="New heading. Leave out to keep the current heading.",
+    )
+    async def manage_edit(
+        self,
+        interaction: discord.Interaction,
+        message_id: app_commands.Range[str, 1, 25],
+        message: Optional[app_commands.Range[str, 1, MAX_CONTENT_LENGTH]] = None,
+        title: Optional[app_commands.Range[str, 1, MAX_TITLE_LENGTH]] = None,
+    ) -> None:
+        if not await self._staff(interaction):
+            return
+        try:
+            result = await ops.edit_announcement(
+                self.bot.gateway,
+                self.bot.config,
+                interaction.guild_id,
+                _actor(interaction),
+                message_id=message_id,
+                message=message,
+                title=title,
+            )
+        except OperationError as exc:
+            await self._reply(interaction, str(exc))
+            return
+        await self._reply(interaction, f"Updated the announcement “{result['title']}”.")
+
+    @manage_group.command(name="delete", description="Delete an announcement the bot posted.")
+    @app_commands.describe(message_id="The message's ID. Right-click it and choose Copy Message ID.")
+    async def manage_delete(
+        self, interaction: discord.Interaction, message_id: app_commands.Range[str, 1, 25]
+    ) -> None:
+        if not await self._staff(interaction):
+            return
+        try:
+            await ops.delete_announcement(
+                self.bot.gateway, self.bot.config, interaction.guild_id, _actor(interaction), message_id=message_id
+            )
+        except OperationError as exc:
+            await self._reply(interaction, str(exc))
+            return
+        await self._reply(interaction, "Deleted the announcement.")
+
+    @manage_group.command(name="quiet", description="Hold scheduled posts overnight. Use off to turn it off.")
+    @app_commands.describe(
+        start="When quiet time starts, 24-hour, e.g. 22:00. Type off to turn it off.",
+        end="When it ends, 24-hour, e.g. 08:00.",
+    )
+    async def manage_quiet(
+        self,
+        interaction: discord.Interaction,
+        start: Optional[app_commands.Range[str, 1, 10]] = None,
+        end: Optional[app_commands.Range[str, 1, 10]] = None,
+    ) -> None:
+        if not await self._staff(interaction):
+            return
+        guild_id = interaction.guild_id
+        if start is None and end is None:
+            quiet_start, quiet_end = settings.get_quiet_hours(self.bot.config, guild_id)
+            if quiet_start and quiet_end:
+                text = f"Quiet hours are {quiet_start} to {quiet_end} (server time). Scheduled posts wait for them to end."
+            else:
+                text = "Quiet hours are off."
+            await self._reply(interaction, text)
+            return
+        if start is not None and start.strip().lower() == "off":
+            changes: dict[str, Any] = {"quiet_start": None, "quiet_end": None}
+        else:
+            changes = {"quiet_start": start, "quiet_end": end}
+        try:
+            await ops.update_settings(self.bot.gateway, self.bot.config, guild_id, _actor(interaction), changes)
+        except OperationError as exc:
+            await self._reply(interaction, str(exc))
+            return
+        if changes["quiet_start"] is None:
+            await self._reply(interaction, "Quiet hours are off.")
+        else:
+            await self._reply(
+                interaction,
+                f"Quiet hours set: {changes['quiet_start']} to {changes['quiet_end']} (server time). "
+                "Scheduled posts due in that window will wait for it to end.",
+            )
+
     @manage_group.command(name="setup", description="Set the staff role, channels, timezone and dashboard links.")
     @app_commands.describe(
         staff_role="Members with this role can run /manage commands.",
         announcement_channel="Default channel for announcements, polls and events.",
         staff_channel="Channel that logs everything that is posted.",
         timezone_name="IANA timezone for typed times, e.g. America/Toronto.",
+        require_approval="Hold announcements until another staff member approves them.",
     )
     @app_commands.rename(timezone_name="timezone")
     async def setup_cmd(
@@ -799,6 +987,7 @@ class CombatMasterCog(commands.Cog):
         announcement_channel: Optional[discord.TextChannel] = None,
         staff_channel: Optional[discord.TextChannel] = None,
         timezone_name: Optional[app_commands.Range[str, 1, 64]] = None,
+        require_approval: Optional[bool] = None,
     ) -> None:
         if not await self._begin(interaction):
             return
@@ -814,6 +1003,8 @@ class CombatMasterCog(commands.Cog):
             changes["staff_channel_id"] = staff_channel.id
         if timezone_name:
             changes["timezone"] = timezone_name
+        if require_approval is not None:
+            changes["require_approval"] = require_approval
         if not changes:
             await self._reply(interaction, "Nothing changed. Pass at least one option to update it.")
             return

@@ -29,6 +29,8 @@ MIN_SCHEDULE_AHEAD = timedelta(minutes=1)
 MIN_REPEAT_INTERVAL = timedelta(minutes=15)
 MAX_REPEAT_INTERVAL = timedelta(days=365)
 MAX_TEMPLATE_NAME = 40
+MIN_PIN = timedelta(minutes=5)
+MAX_PIN = timedelta(days=30)
 DEFAULT_HISTORY_LIMIT = 10
 MAX_HISTORY_LIMIT = 100
 ERROR_TEXT_LIMIT = 500
@@ -123,6 +125,20 @@ def parse_interval(text: str) -> int:
         raise ValueError("A repeat must be at least 15 minutes apart.")
     if seconds > MAX_REPEAT_INTERVAL.total_seconds():
         raise ValueError("A repeat can be at most 365 days apart.")
+    return seconds
+
+
+def parse_pin(text: Optional[str]) -> Optional[int]:
+    """How long to pin an announcement, in seconds. ``None`` or blank means don't pin."""
+    if not (text or "").strip():
+        return None
+    seconds = parse_duration(text)
+    if seconds is None:
+        raise ValueError("I could not read the pin time. Use something like `24h` or `3d`.")
+    if seconds < MIN_PIN.total_seconds():
+        raise ValueError("Pin for at least 5 minutes.")
+    if seconds > MAX_PIN.total_seconds():
+        raise ValueError("Pin for at most 30 days.")
     return seconds
 
 
@@ -274,8 +290,32 @@ def record_announcement(
 def list_history(guild_id: int, limit: int = DEFAULT_HISTORY_LIMIT) -> list[dict[str, Any]]:
     limit = max(1, min(int(limit), MAX_HISTORY_LIMIT))
     return store.db_fetchall(
-        "SELECT * FROM announcements WHERE guild_id = ? ORDER BY created_at DESC, id DESC LIMIT ?",
+        "SELECT * FROM announcements WHERE guild_id = ? AND deleted_at IS NULL "
+        "ORDER BY created_at DESC, id DESC LIMIT ?",
         (int(guild_id), limit),
+    )
+
+
+def get_announcement(guild_id: int, message_id: int) -> Optional[dict[str, Any]]:
+    """The recorded announcement for a Discord message, if it is one of ours and not deleted."""
+    return store.db_fetchone(
+        "SELECT * FROM announcements WHERE guild_id = ? AND message_id = ? AND deleted_at IS NULL "
+        "ORDER BY id DESC LIMIT 1",
+        (int(guild_id), int(message_id)),
+    )
+
+
+def update_announcement(row_id: int, *, title: str, body: str, now: Optional[datetime] = None) -> None:
+    store.db_execute(
+        "UPDATE announcements SET title = ?, body = ?, edited_at = ? WHERE id = ?",
+        (title, body, iso_utc(now or datetime.now(timezone.utc)), int(row_id)),
+    )
+
+
+def mark_announcement_deleted(row_id: int, now: Optional[datetime] = None) -> None:
+    store.db_execute(
+        "UPDATE announcements SET deleted_at = ? WHERE id = ?",
+        (iso_utc(now or datetime.now(timezone.utc)), int(row_id)),
     )
 
 
@@ -294,12 +334,13 @@ def add_scheduled(
     send_at: datetime,
     publish: bool = False,
     interval_seconds: Optional[int] = None,
+    pin_seconds: Optional[int] = None,
     now: Optional[datetime] = None,
 ) -> int:
     return store.db_insert(
         "INSERT INTO scheduled_announcements (guild_id, channel_id, author_id, author_name, title, "
-        "body, mention_role_id, publish, send_at, interval_seconds, runs, status, created_at) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 'pending', ?)",
+        "body, mention_role_id, publish, send_at, interval_seconds, pin_seconds, runs, status, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 'pending', ?)",
         (
             int(guild_id),
             int(channel_id),
@@ -311,8 +352,17 @@ def add_scheduled(
             1 if publish else 0,
             iso_utc(send_at),
             interval_seconds,
+            pin_seconds,
             iso_utc(now or datetime.now(timezone.utc)),
         ),
+    )
+
+
+def set_send_at(schedule_id: int, when: datetime) -> None:
+    """Move a pending announcement to a new time, for example the end of quiet hours."""
+    store.db_execute(
+        "UPDATE scheduled_announcements SET send_at = ? WHERE id = ? AND status = 'pending'",
+        (iso_utc(when), int(schedule_id)),
     )
 
 

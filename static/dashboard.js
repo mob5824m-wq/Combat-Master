@@ -320,6 +320,9 @@
     form.elements.announcement_channel_id.value = s.announcement_channel_id ? String(s.announcement_channel_id) : "";
     form.elements.staff_channel_id.value = s.staff_channel_id ? String(s.staff_channel_id) : "";
     form.elements.timezone.value = s.timezone || "";
+    form.elements.require_approval.checked = Boolean(s.require_approval);
+    form.elements.quiet_start.value = s.quiet_start || "";
+    form.elements.quiet_end.value = s.quiet_end || "";
   }
 
   function fillWelcomeForm() {
@@ -359,6 +362,7 @@
     overview: loadOverview,
     announce: loadAnnounceHistory,
     scheduled: loadScheduled,
+    approvals: loadApprovals,
     templates: loadTemplates,
     polls: loadPolls,
     events: loadEvents,
@@ -388,6 +392,8 @@
       ["Templates", s.templates],
       ["Open polls", s.polls_open],
       ["Upcoming events", s.events_upcoming],
+      ["Awaiting approval", s.approvals_pending],
+      ["Pinned", s.pins_active],
       ["Welcome", s.welcome_enabled ? "On" : "Off"],
     ];
     $("#stats").replaceChildren(...cards.map(([label, value]) =>
@@ -399,6 +405,21 @@
   }
 
   function announcementRow(row) {
+    const buttons = [];
+    if (row.message_id) {
+      const edit = el("button", { type: "button", class: "ghost small", text: "Edit" });
+      edit.addEventListener("click", () => {
+        if (state.tab !== "announce") showTab("announce");
+        openEdit(row);
+      });
+      const remove = el("button", { type: "button", class: "danger small", text: "Delete" });
+      remove.addEventListener("click", () => {
+        if (!window.confirm(`Delete “${row.title}” from Discord? This can not be undone.`)) return;
+        runAction(remove, () => api(`guilds/${state.guildId}/announcements/${row.message_id}`, { method: "DELETE" }),
+          "Deleted the announcement.", refreshTab);
+      });
+      buttons.push(edit, remove);
+    }
     return el("li", {}, [
       el("div", { class: "grow" }, [
         el("strong", { text: row.title }),
@@ -408,8 +429,48 @@
         }),
         el("div", { class: "body", text: truncate(row.body) }),
       ]),
+      ...buttons,
     ]);
   }
+
+  // Editing a posted announcement reuses the form on the Announce tab.
+  function openEdit(row) {
+    const form = $("#edit-form");
+    form.hidden = false;
+    form.elements.message_id.value = String(row.message_id);
+    form.elements.title.value = row.title || "";
+    form.elements.message.value = row.body || "";
+    $("#edit-where").textContent = `in ${channelName(row.channel_id)}`;
+    form.scrollIntoView({ block: "center" });
+    form.elements.message.focus();
+  }
+
+  function closeEdit() {
+    const form = $("#edit-form");
+    form.reset();
+    form.hidden = true;
+  }
+
+  function approvalNotice(result) {
+    return `Sent for approval as #${result.approval_id}. Someone other than you can approve it in the Approvals tab.`;
+  }
+
+  $("#edit-cancel").addEventListener("click", closeEdit);
+
+  $("#edit-form").addEventListener("submit", (event) => {
+    event.preventDefault();
+    const form = event.currentTarget;
+    const f = new FormData(form);
+    submitForm(
+      form,
+      () => api(`guilds/${state.guildId}/announcements/${f.get("message_id")}`, {
+        method: "PATCH",
+        body: { title: f.get("title"), message: f.get("message") },
+      }),
+      "Saved the changes.",
+      async () => { closeEdit(); await refreshTab(); },
+    );
+  });
 
   // ------------------------------------------------------------------ //
   // Announce now
@@ -428,9 +489,13 @@
           channel_id: opt(f, "channel_id"),
           mention_role_id: opt(f, "mention_role_id"),
           publish: f.has("publish"),
+          pin_for: opt(f, "pin_for"),
         },
       }),
-      (r) => withWarnings(`Posted${r.jump_url ? `: ${r.jump_url}` : "."}`, r),
+      (r) => (r.queued ? approvalNotice(r) : withWarnings(
+        `Posted${r.jump_url ? `: ${r.jump_url}` : "."}${r.pinned_until ? ` Pinned until ${fmtTime(r.pinned_until)}.` : ""}`,
+        r,
+      )),
       async () => { form.reset(); fillSelects(); await loadAnnounceHistory(); },
     );
   });
@@ -459,14 +524,15 @@
           channel_id: opt(f, "channel_id"),
           mention_role_id: opt(f, "mention_role_id"),
           publish: f.has("publish"),
+          pin_for: opt(f, "pin_for"),
         },
       }),
-      (r) => withWarnings(
+      (r) => (r.queued ? approvalNotice(r) : withWarnings(
         r.repeat_seconds
           ? `Repeating #${r.id} starts ${fmtTime(r.send_at)}.`
-          : `Scheduled #${r.id} for ${fmtTime(r.send_at)}.`,
+          : `Scheduled #${r.id} for ${fmtTime(r.send_at)}.${r.pinned ? " It will be pinned when it posts." : ""}`,
         r,
-      ),
+      )),
       async () => { form.reset(); fillSelects(); await loadScheduled(); },
     );
   });
@@ -496,6 +562,42 @@
         el("div", { class: "body", text: truncate(row.body) }),
       ]),
       button,
+    ]);
+  }
+
+  // ------------------------------------------------------------------ //
+  // Approval queue
+  // ------------------------------------------------------------------ //
+  async function loadApprovals() {
+    const rows = await api(`guilds/${state.guildId}/approvals`);
+    renderList($("#approval-list"), rows, approvalRow, "Nothing is waiting for approval.");
+  }
+
+  function approvalRow(row) {
+    const approve = el("button", { type: "button", class: "small", text: "Approve" });
+    approve.addEventListener("click", () => {
+      if (!window.confirm(`Approve #${row.id} and send it now?`)) return;
+      runAction(approve, () => api(`guilds/${state.guildId}/approvals/${row.id}/approve`, { method: "POST" }),
+        (r) => (r.jump_url ? `Approved and posted: ${r.jump_url}` : `Approved #${row.id}.`), loadApprovals);
+    });
+    const reject = el("button", { type: "button", class: "danger small", text: "Reject" });
+    reject.addEventListener("click", () => {
+      if (!window.confirm(`Turn down #${row.id}?`)) return;
+      runAction(reject, () => api(`guilds/${state.guildId}/approvals/${row.id}/reject`, { method: "POST" }),
+        `Turned down #${row.id}.`, loadApprovals);
+    });
+    const what = row.kind === "schedule" ? "Schedule" : "Announcement";
+    return el("li", {}, [
+      el("div", { class: "grow" }, [
+        el("strong", { text: `#${row.id} · ${what} · ${row.summary}` }),
+        el("div", {
+          class: "meta",
+          text: `requested by ${row.requester_name} (${row.requester_source}) · ${fmtTime(row.created_at)}`,
+        }),
+        el("div", { class: "body", text: truncate(row.payload && row.payload.message) }),
+      ]),
+      approve,
+      reject,
     ]);
   }
 
@@ -739,6 +841,9 @@
           announcement_channel_id: opt(f, "announcement_channel_id"),
           staff_channel_id: opt(f, "staff_channel_id"),
           timezone: opt(f, "timezone"),
+          require_approval: f.has("require_approval"),
+          quiet_start: opt(f, "quiet_start"),
+          quiet_end: opt(f, "quiet_end"),
         },
       }),
       "Settings saved.",
@@ -750,6 +855,22 @@
   // Audit log
   // ------------------------------------------------------------------ //
   $("#audit-refresh").addEventListener("click", () => loadAudit());
+
+  $("#audit-export").addEventListener("click", (event) => {
+    runAction(event.currentTarget, async () => {
+      const response = await fetch(`api/guilds/${state.guildId}/audit.csv`, {
+        credentials: "same-origin",
+        cache: "no-store",
+      });
+      if (!response.ok) throw new Error(`The export failed (${response.status}). Sign in again if the session ended.`);
+      const url = URL.createObjectURL(await response.blob());
+      const link = el("a", { href: url, download: `combat-master-audit-${state.guildId}.csv` });
+      document.body.append(link);
+      link.click();
+      link.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+    }, "Downloaded the audit log as CSV.");
+  });
 
   async function loadAudit() {
     const rows = await api(`guilds/${state.guildId}/audit?limit=50`);

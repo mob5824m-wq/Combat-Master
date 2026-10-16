@@ -42,6 +42,7 @@
         <button type="button" data-tab="overview" class="active">Overview</button>
         <button type="button" data-tab="announce">Announce</button>
         <button type="button" data-tab="scheduled">Scheduled</button>
+        <button type="button" data-tab="approvals">Approvals</button>
         <button type="button" data-tab="templates">Templates</button>
         <button type="button" data-tab="polls">Polls</button>
         <button type="button" data-tab="events">Events</button>
@@ -74,8 +75,25 @@
           <label>Ping role
             <select name="mention_role_id" class="role-select"></select>
           </label>
+          <label>Pin for (optional)
+            <input name="pin_for" placeholder="24h, 3d. Blank means no pin">
+          </label>
           <label class="check"><input type="checkbox" name="publish"> Publish to followers (announcement channels)</label>
           <div class="actions span2"><button type="submit">Post now</button></div>
+        </form>
+        <form id="edit-form" class="grid" hidden>
+          <input type="hidden" name="message_id">
+          <p class="span2"><strong>Edit announcement <span id="edit-where"></span></strong></p>
+          <label class="span2">Heading
+            <input name="title" maxlength="256">
+          </label>
+          <label class="span2">Message
+            <textarea name="message" rows="6" maxlength="4000" required></textarea>
+          </label>
+          <div class="actions span2">
+            <button type="submit">Save changes</button>
+            <button type="button" class="ghost" id="edit-cancel">Cancel</button>
+          </div>
         </form>
         <h3>Recent</h3>
         <ul id="announce-history" class="list"></ul>
@@ -103,11 +121,21 @@
           <label>Ping role
             <select name="mention_role_id" class="role-select"></select>
           </label>
+          <label>Pin for (optional)
+            <input name="pin_for" placeholder="24h, 3d. One-offs only">
+          </label>
           <label class="check"><input type="checkbox" name="publish"> Publish to followers</label>
           <div class="actions span2"><button type="submit">Schedule</button></div>
         </form>
         <h3>Waiting to go out</h3>
         <ul id="scheduled-list" class="list"></ul>
+      </section>
+
+      <!-- Approval queue -->
+      <section class="panel" data-panel="approvals" hidden>
+        <h2>Approval queue</h2>
+        <p class="muted">When “Require approval” is on in Settings, announcements wait here. Someone other than the person who asked must approve them.</p>
+        <ul id="approval-list" class="list"></ul>
       </section>
 
       <!-- Templates -->
@@ -226,6 +254,14 @@
           <label>Timezone for typed times
             <input name="timezone" placeholder="America/Toronto">
           </label>
+          <label class="check span2"><input type="checkbox" name="require_approval"> Require approval: announcements wait for another staff member to approve them</label>
+          <label>Quiet hours start
+            <input name="quiet_start" placeholder="22:00">
+          </label>
+          <label>Quiet hours end
+            <input name="quiet_end" placeholder="08:00">
+          </label>
+          <p class="span2 muted">Quiet hours hold scheduled and repeating posts until the window ends. Use 24-hour times in the server's timezone. Leave both empty to turn them off.</p>
           <p class="span2 muted">Staff role: once set, only its holders (and administrators) can use staff tools. Leave it empty to fall back to Manage Server.</p>
           <div class="actions span2"><button type="submit">Save settings</button></div>
         </form>
@@ -234,7 +270,10 @@
       <!-- Audit -->
       <section class="panel" data-panel="audit" hidden>
         <h2>Audit log</h2>
-        <div class="actions"><button type="button" class="ghost" id="audit-refresh">Refresh</button></div>
+        <div class="actions">
+          <button type="button" class="ghost" id="audit-refresh">Refresh</button>
+          <button type="button" class="ghost" id="audit-export">Export CSV</button>
+        </div>
         <ul id="audit-list" class="list"></ul>
       </section>
     </div>

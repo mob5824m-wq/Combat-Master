@@ -7,6 +7,8 @@ dashboard's Audit page read it back.
 
 from __future__ import annotations
 
+import csv
+import io
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
@@ -52,3 +54,28 @@ def list_entries(guild_id: int, limit: int = DEFAULT_LIMIT) -> list[dict[str, An
         "SELECT * FROM audit_log WHERE guild_id = ? ORDER BY created_at DESC, id DESC LIMIT ?",
         (int(guild_id), limit),
     )
+
+
+CSV_COLUMNS = ("created_at", "actor_name", "source", "action", "detail", "actor_id")
+# Spreadsheets run a cell that starts with one of these as a formula.
+_FORMULA_START = ("=", "+", "-", "@", "\t", "\r")
+
+
+def csv_safe(value: Any) -> str:
+    """Text for a CSV cell, with a leading apostrophe on anything that looks like a formula."""
+    text = "" if value is None else str(value)
+    return "'" + text if text.startswith(_FORMULA_START) else text
+
+
+def to_csv(guild_id: int) -> str:
+    """The whole audit log for one server, oldest first, as CSV text."""
+    rows = store.db_fetchall(
+        "SELECT * FROM audit_log WHERE guild_id = ? ORDER BY created_at, id",
+        (int(guild_id),),
+    )
+    buffer = io.StringIO()
+    writer = csv.writer(buffer)
+    writer.writerow(CSV_COLUMNS)
+    for row in rows:
+        writer.writerow([csv_safe(row[column]) for column in CSV_COLUMNS])
+    return buffer.getvalue()

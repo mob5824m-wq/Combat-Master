@@ -190,6 +190,12 @@ class DashboardServer:
         r.add_delete(f"{g}/welcome", self._welcome_off)
         r.add_post(f"{g}/welcome/test", self._welcome_test)
         r.add_get(f"{g}/audit", self._audit)
+        r.add_get(f"{g}/audit.csv", self._audit_csv)
+        r.add_patch(f"{g}/announcements/{{mid}}", self._announcement_edit)
+        r.add_delete(f"{g}/announcements/{{mid}}", self._announcement_delete)
+        r.add_get(f"{g}/approvals", self._approvals_list)
+        r.add_post(f"{g}/approvals/{{rid}}/approve", self._approval_approve)
+        r.add_post(f"{g}/approvals/{{rid}}/reject", self._approval_reject)
         return app
 
     # ------------------------------------------------------------------ #
@@ -417,6 +423,9 @@ class DashboardServer:
             "timezone": cfg["timezone"],
             "welcome_channel_id": cfg["welcome_channel_id"],
             "welcome_message": cfg["welcome_message"],
+            "require_approval": cfg["require_approval"],
+            "quiet_start": cfg["quiet_start"],
+            "quiet_end": cfg["quiet_end"],
             "default_welcome_message": welcome.DEFAULT_WELCOME_MESSAGE,
             "placeholders": list(welcome.PLACEHOLDERS),
         }
@@ -460,6 +469,7 @@ class DashboardServer:
             channel_id=_as_int(body.get("channel_id"), "channel_id"),
             mention_role_id=_as_int(body.get("mention_role_id"), "mention_role_id"),
             publish=_as_bool(body.get("publish")),
+            pin_for=body.get("pin_for") or None,
         )
         return self._json(result)
 
@@ -484,6 +494,7 @@ class DashboardServer:
             mention_role_id=_as_int(body.get("mention_role_id"), "mention_role_id"),
             publish=_as_bool(body.get("publish")),
             repeat_every=body.get("repeat_every") or None,
+            pin_for=body.get("pin_for") or None,
         )
         return self._json(result, status=201)
 
@@ -636,6 +647,66 @@ class DashboardServer:
             members=guild["member_count"],
         )
         return self._json(result)
+
+    async def _announcement_edit(self, request: web.Request) -> web.Response:
+        self._authed(request)
+        guild = await self._guild(request)
+        body = await self._body(request)
+        result = await ops.edit_announcement(
+            self.gateway,
+            self.config,
+            guild["id"],
+            DASHBOARD_ACTOR,
+            message_id=_as_int(request.match_info["mid"], "message_id"),
+            message=str(body.get("message") or "") if "message" in body else None,
+            title=str(body.get("title") or "") if "title" in body else None,
+        )
+        return self._json(result)
+
+    async def _announcement_delete(self, request: web.Request) -> web.Response:
+        self._authed(request)
+        guild = await self._guild(request)
+        await ops.delete_announcement(
+            self.gateway,
+            self.config,
+            guild["id"],
+            DASHBOARD_ACTOR,
+            message_id=_as_int(request.match_info["mid"], "message_id"),
+        )
+        return self._json({"ok": True})
+
+    async def _approvals_list(self, request: web.Request) -> web.Response:
+        self._authed(request)
+        guild = await self._guild(request)
+        return self._json(ops.list_approvals(guild["id"]))
+
+    async def _approval_approve(self, request: web.Request) -> web.Response:
+        self._authed(request)
+        guild = await self._guild(request)
+        result = await ops.approve_request(
+            self.gateway,
+            self.config,
+            guild["id"],
+            DASHBOARD_ACTOR,
+            _as_int(request.match_info["rid"], "id"),
+        )
+        return self._json(result)
+
+    async def _approval_reject(self, request: web.Request) -> web.Response:
+        self._authed(request)
+        guild = await self._guild(request)
+        await ops.reject_request(guild["id"], DASHBOARD_ACTOR, _as_int(request.match_info["rid"], "id"))
+        return self._json({"ok": True})
+
+    async def _audit_csv(self, request: web.Request) -> web.Response:
+        self._authed(request)
+        guild = await self._guild(request)
+        return web.Response(
+            text=ops.export_audit_csv(guild["id"]),
+            content_type="text/csv",
+            charset="utf-8",
+            headers={"Content-Disposition": f'attachment; filename="combat-master-audit-{guild["id"]}.csv"'},
+        )
 
     async def _audit(self, request: web.Request) -> web.Response:
         self._authed(request)

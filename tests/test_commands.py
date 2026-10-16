@@ -33,6 +33,7 @@ sys.path.insert(0, str(REPO_ROOT))
 from discord import app_commands  # noqa: E402
 
 import audit  # noqa: E402
+import announcements as ann  # noqa: E402
 import bot as bot_module  # noqa: E402
 import command_tree  # noqa: E402
 import settings  # noqa: E402
@@ -135,7 +136,8 @@ class CommandTreeTests(unittest.TestCase):
         self.assertEqual(
             set(top),
             {"announce", "schedule", "repeat", "scheduled", "cancel", "history", "template",
-             "poll", "event", "welcome", "status", "audit", "setup", "fixcommands"},
+             "poll", "event", "welcome", "status", "audit", "setup", "fixcommands",
+             "queue", "approve", "reject", "edit", "delete", "quiet"},
         )
         self.assertEqual({c.name for c in top["template"].commands}, {"save", "list", "delete", "use"})
         self.assertEqual({c.name for c in top["poll"].commands}, {"create", "list", "close"})
@@ -323,6 +325,121 @@ class CommandHandlerTests(unittest.TestCase):
         interaction.guild_id = None
         self.call("manage_status", interaction)
         self.assertIn("only work inside a server", interaction.followup.last_text)
+
+
+
+class CommandFeatureTests(unittest.TestCase):
+    """The approval, edit, delete and quiet-hours commands, run against a DemoGateway."""
+
+    call = CommandHandlerTests.call
+
+    def setUp(self) -> None:
+        ensure_cog_registered()
+        self._tmp = tempfile.TemporaryDirectory()
+        self._old = os.environ.get("COMBAT_MASTER_DATA")
+        os.environ["COMBAT_MASTER_DATA"] = self._tmp.name
+        store.init_db()
+        self.gw = DemoGateway()
+        self.cfg = copy.deepcopy(settings.DEFAULT_CONFIG)
+        settings.set_guild_value(self.cfg, GUILD, "announcement_channel_id", ANNOUNCE)
+        settings.set_guild_value(self.cfg, GUILD, "staff_channel_id", STAFF_LOG)
+        settings.set_guild_value(self.cfg, GUILD, "staff_role_id", STAFF_ROLE)
+        bot_module.bot.gateway = self.gw
+        bot_module.bot.config = self.cfg
+        self.cog = bot_module.bot.get_cog("CombatMasterCog")
+
+    def tearDown(self) -> None:
+        if self._old is None:
+            os.environ.pop("COMBAT_MASTER_DATA", None)
+        else:
+            os.environ["COMBAT_MASTER_DATA"] = self._old
+        self._tmp.cleanup()
+
+    def ada(self):
+        return fake_interaction(roles=[STAFF_ROLE], user_id=42, name="Ada")
+
+    def announcement_posts(self):
+        """Posts to the announcement channel only; queued requests are also logged to the staff channel."""
+        return [post for post in self.gw.posts if post["channel_id"] == ANNOUNCE]
+
+    def ben(self):
+        return fake_interaction(roles=[STAFF_ROLE], user_id=43, name="Ben")
+
+    def test_queued_post_is_approved_by_a_different_staff_member(self):
+        settings.set_guild_value(self.cfg, GUILD, "require_approval", True)
+        request = self.ada()
+        self.call("manage_announce", request, message="Hold this for review")
+        self.assertIn("approval queue as **#1**", request.followup.last_text)
+        self.assertEqual(self.announcement_posts(), [])
+
+        listing = self.ada()
+        self.call("manage_queue", listing)
+        self.assertEqual(listing.followup.sent[-1]["embed"].title, "Waiting for approval")
+
+        own = self.ada()
+        self.call("manage_approve", own, request_id=1)
+        self.assertIn("own request", own.followup.last_text)
+        self.assertEqual(self.announcement_posts(), [])
+
+        approved = self.ben()
+        self.call("manage_approve", approved, request_id=1)
+        self.assertIn("Approved **#1**", approved.followup.last_text)
+        self.assertEqual(len(self.announcement_posts()), 1)
+
+    def test_reject_turns_a_queued_post_down(self):
+        settings.set_guild_value(self.cfg, GUILD, "require_approval", True)
+        self.call("manage_announce", self.ada(), message="Not this one")
+        rejected = self.ben()
+        self.call("manage_reject", rejected, request_id=1)
+        self.assertIn("Turned down **#1**", rejected.followup.last_text)
+        self.assertEqual(self.announcement_posts(), [])
+
+    def test_edit_then_delete_a_post_the_bot_made(self):
+        self.call("manage_announce", self.ada(), message="Doors at 8")
+        message_id = ann.list_history(GUILD, 1)[0]["message_id"]
+
+        edit = self.ada()
+        self.call("manage_edit", edit, message_id=str(message_id), message="Doors at 9", title="Raid")
+        self.assertIn("Updated the announcement", edit.followup.last_text)
+
+        delete = self.ada()
+        self.call("manage_delete", delete, message_id=str(message_id))
+        self.assertIn("Deleted the announcement", delete.followup.last_text)
+        self.assertEqual(ann.list_history(GUILD, 10), [])
+
+    def test_editing_an_unknown_message_is_explained(self):
+        interaction = self.ada()
+        self.call("manage_edit", interaction, message_id="555", message="x", title=None)
+        self.assertTrue(interaction.followup.last_text)
+        self.assertNotIn("Updated", interaction.followup.last_text)
+
+    def test_quiet_hours_show_set_and_turn_off(self):
+        shown = self.ada()
+        self.call("manage_quiet", shown)
+        self.assertIn("Quiet hours are off", shown.followup.last_text)
+
+        set_up = self.ada()
+        self.call("manage_quiet", set_up, start="22:00", end="08:00")
+        self.assertIn("Quiet hours set: 22:00 to 08:00", set_up.followup.last_text)
+        self.assertEqual(settings.get_quiet_hours(bot_module.bot.config, GUILD), ("22:00", "08:00"))
+
+        off = self.ada()
+        self.call("manage_quiet", off, start="off", end=None)
+        self.assertIn("Quiet hours are off", off.followup.last_text)
+        self.assertEqual(settings.get_quiet_hours(bot_module.bot.config, GUILD), (None, None))
+
+    def test_a_bad_quiet_time_changes_nothing(self):
+        bad = self.ada()
+        self.call("manage_quiet", bad, start="25:00", end="08:00")
+        self.assertEqual(settings.get_quiet_hours(bot_module.bot.config, GUILD), (None, None))
+
+    def test_outsiders_cannot_use_the_new_commands(self):
+        outsider = fake_interaction(user_id=77, name="Eve")
+        self.call("manage_queue", outsider)
+        self.call("manage_approve", outsider, request_id=1)
+        self.call("manage_quiet", outsider, start="22:00", end="08:00")
+        self.assertEqual(settings.get_quiet_hours(bot_module.bot.config, GUILD), (None, None))
+        self.assertEqual(self.announcement_posts(), [])
 
 
 if __name__ == "__main__":

@@ -140,6 +140,33 @@ class DiscordGateway:
         except discord.HTTPException as exc:
             raise OperationError(f"Could not update the message ({exc}).") from None
 
+    async def delete_message(self, guild_id: int, channel_id: int, message_id: int) -> None:
+        channel = await self._channel(guild_id, channel_id)
+        try:
+            # A partial message deletes without fetching first, so a message that
+            # is already gone (NotFound) simply counts as deleted.
+            await channel.get_partial_message(int(message_id)).delete()
+        except discord.NotFound:
+            return
+        except discord.HTTPException as exc:
+            raise OperationError(f"Could not delete the message ({exc}).") from None
+
+    async def pin_message(self, guild_id: int, channel_id: int, message_id: int) -> None:
+        message = await self._message(guild_id, channel_id, message_id)
+        try:
+            await message.pin()
+        except discord.HTTPException as exc:
+            raise OperationError(
+                f"Discord would not pin it ({exc}). Check that I have Manage Messages in that channel."
+            ) from None
+
+    async def unpin_message(self, guild_id: int, channel_id: int, message_id: int) -> None:
+        message = await self._message(guild_id, channel_id, message_id)
+        try:
+            await message.unpin()
+        except discord.HTTPException as exc:
+            raise OperationError(f"Discord would not unpin it ({exc}).") from None
+
     # ---- reactions ---------------------------------------------------- #
     async def reaction_counts(
         self, guild_id: int, channel_id: int, message_id: int, emojis: list[str]

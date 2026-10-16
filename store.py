@@ -122,6 +122,40 @@ CREATE TABLE IF NOT EXISTS audit_log (
     created_at  TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_audit_guild ON audit_log (guild_id, created_at DESC);
+
+-- Announcements waiting for a second staff member. payload is the JSON the
+-- operation needs to run once approved. The requester and the decider are
+-- recorded as (source, id) pairs, so the same person can not approve their own.
+CREATE TABLE IF NOT EXISTS approval_requests (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    guild_id          INTEGER NOT NULL,
+    kind              TEXT NOT NULL,            -- announce | schedule
+    payload           TEXT NOT NULL,            -- JSON
+    summary           TEXT NOT NULL,
+    requester_id      INTEGER NOT NULL,
+    requester_source  TEXT NOT NULL,
+    requester_name    TEXT NOT NULL,
+    status            TEXT NOT NULL DEFAULT 'pending',  -- pending | approved | rejected
+    decided_id        INTEGER,
+    decided_source    TEXT,
+    decided_name      TEXT,
+    decided_at        TEXT,
+    created_at        TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_approvals_guild ON approval_requests (guild_id, status);
+
+-- Announcements pinned for a while. The scheduler unpins them when unpin_at passes.
+CREATE TABLE IF NOT EXISTS pinned_posts (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    guild_id    INTEGER NOT NULL,
+    channel_id  INTEGER NOT NULL,
+    message_id  INTEGER NOT NULL,
+    unpin_at    TEXT NOT NULL,                -- UTC
+    status      TEXT NOT NULL DEFAULT 'pinned',  -- pinned | unpinned | failed
+    error       TEXT,
+    created_at  TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_pins_due ON pinned_posts (status, unpin_at);
 """
 
 # Columns added after a first release. (table, column, declaration)
@@ -131,6 +165,9 @@ _ADDED_COLUMNS = [
     ("scheduled_announcements", "runs", "INTEGER NOT NULL DEFAULT 0"),
     ("scheduled_announcements", "author_name", "TEXT"),
     ("announcements", "author_name", "TEXT"),
+    ("announcements", "edited_at", "TEXT"),
+    ("announcements", "deleted_at", "TEXT"),
+    ("scheduled_announcements", "pin_seconds", "INTEGER"),
 ]
 
 
