@@ -1,22 +1,31 @@
-"""Per-server configuration and the staff permission rule.
+"""Per-server configuration, the dashboard settings and the staff permission rule.
 
-Config shape (``config.json``)::
+Config shape (``data/config.json``)::
 
     {
       "bot_token": "...",
       "default_timezone": "America/Toronto",
+      "dashboard_enabled": true,
+      "dashboard_host": "127.0.0.1",
+      "dashboard_port": 8765,
+      "dashboard_token": "...",            # generated on first run
+      "dashboard_secure_cookie": false,
+      "dashboard_allowed_hosts": [],       # extra Host names (reverse proxy)
+      "dashboard_trusted_proxies": [],     # addresses whose X-Forwarded-For counts
       "guilds": {
         "<guild id>": {
-          "staff_role_id": 123,            # may run every /manage command
-          "announcement_channel_id": 456,  # default target of /manage announce
-          "staff_channel_id": 789,         # log of everything that was posted
-          "timezone": "America/Toronto"    # how typed times are read
+          "staff_role_id": 123,
+          "announcement_channel_id": 456,
+          "staff_channel_id": 789,
+          "timezone": "America/Toronto",
+          "welcome_channel_id": 321,
+          "welcome_message": "Welcome {mention}!"
         }
       }
     }
 
-Each server is configured on its own with ``/manage setup``. Nothing here
-touches Discord or the database, which is what makes it easy to test.
+Each server is configured on its own. Nothing here touches Discord or the
+database, which keeps it easy to test.
 """
 
 from __future__ import annotations
@@ -39,6 +48,13 @@ DEFAULT_TIMEZONE = "America/Toronto"
 DEFAULT_CONFIG: dict[str, Any] = {
     "bot_token": "",
     "default_timezone": DEFAULT_TIMEZONE,
+    "dashboard_enabled": True,
+    "dashboard_host": "127.0.0.1",
+    "dashboard_port": 8765,
+    "dashboard_token": "",
+    "dashboard_secure_cookie": False,
+    "dashboard_allowed_hosts": [],
+    "dashboard_trusted_proxies": [],
     "guilds": {},
 }
 
@@ -47,7 +63,12 @@ DEFAULT_GUILD: dict[str, Any] = {
     "announcement_channel_id": None,
     "staff_channel_id": None,
     "timezone": None,  # None -> the config-wide default_timezone
+    "welcome_channel_id": None,
+    "welcome_message": None,  # None -> the built-in welcome text
 }
+
+# Keys a dashboard or command may change, and the type each one takes.
+SETTABLE_KEYS = tuple(DEFAULT_GUILD)
 
 
 # --------------------------------------------------------------------------- #
@@ -72,16 +93,20 @@ def load_config() -> dict[str, Any]:
             logger.error("Ignoring unreadable config %s (%s).", source, exc)
     if not isinstance(cfg.get("guilds"), dict):
         cfg["guilds"] = {}
+    for key in ("dashboard_allowed_hosts", "dashboard_trusted_proxies"):
+        if not isinstance(cfg.get(key), list):
+            cfg[key] = []
     return cfg
 
 
 def save_config(cfg: dict[str, Any]) -> None:
     """Write the live config to the data directory (never the repository)."""
     target: Path = paths.config_path()
+    target.parent.mkdir(parents=True, exist_ok=True)
     tmp = target.with_suffix(".json.tmp")
     tmp.write_text(json.dumps(cfg, indent=2) + "\n", encoding="utf-8")
     try:
-        os.chmod(tmp, 0o600)  # the file holds the bot token
+        os.chmod(tmp, 0o600)  # the file holds the bot and dashboard secrets
     except OSError:
         pass
     os.replace(tmp, target)
@@ -122,6 +147,10 @@ def get_staff_channel_id(cfg: dict[str, Any], guild_id: int) -> Optional[int]:
     return _as_id(get_guild_config(cfg, guild_id)["staff_channel_id"])
 
 
+def get_welcome_channel_id(cfg: dict[str, Any], guild_id: int) -> Optional[int]:
+    return _as_id(get_guild_config(cfg, guild_id)["welcome_channel_id"])
+
+
 def get_timezone_name(cfg: dict[str, Any], guild_id: int) -> str:
     return str(get_guild_config(cfg, guild_id)["timezone"])
 
@@ -136,7 +165,7 @@ def set_guild_value(cfg: dict[str, Any], guild_id: int, key: str, value: Any) ->
 
 
 # --------------------------------------------------------------------------- #
-# Who may use /manage
+# Who may use the staff commands
 # --------------------------------------------------------------------------- #
 def staff_denial(
     member: Any,
@@ -153,8 +182,6 @@ def staff_denial(
       own: a server can hand that permission to anyone.
     * A server with no staff role yet falls back to *Manage Server*, so a
       fresh install keeps working until ``/manage setup`` is run.
-
-    The returned text is written for the member who hit the wall.
     """
     perms = getattr(member, "guild_permissions", None)
     if perms is not None and getattr(perms, "administrator", False):

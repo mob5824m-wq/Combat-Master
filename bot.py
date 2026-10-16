@@ -1,28 +1,39 @@
 """
-Combat Master - a discord.py bot for staff announcements.
+Combat Master - a discord.py bot for staff announcements and server events.
 
-Everything is reached through one slash-command group, ``/manage``:
+Everything staff use is reached through one slash-command group, ``/manage``:
 
-    /manage announce     post an announcement now (staff)
-    /manage schedule     post an announcement later (staff)
-    /manage scheduled    list announcements waiting to be posted (staff)
-    /manage cancel       cancel a scheduled announcement (staff)
-    /manage history      the most recent announcements (staff)
-    /manage status       this server's settings and what is pending (staff)
-    /manage setup        staff role, channels and timezone (administrators)
-    /manage fixcommands  remove duplicated slash commands and re-sync (admins)
+    Announcements
+      /manage announce        post now (optionally ping a role, publish to followers)
+      /manage schedule        post at a later time
+      /manage repeat          post again and again, every N
+      /manage scheduled       list what is waiting to go out
+      /manage cancel          cancel a scheduled or repeating announcement
+      /manage history         recent announcements
+      /manage template ...    save, list, delete and use reusable text
 
-Staff means: holders of the server's configured staff role, plus
-administrators. Discord's *Manage Server* permission is only the fallback
-until a staff role is set. The check runs again on every command, so a
-mis-configured Discord integration can not expose the commands to others.
+    Polls and events
+      /manage poll ...        create, list and close reaction polls
+      /manage event ...       create, list and cancel events with RSVP and reminders
 
-Announcements are posted as embeds. The bot never pings @everyone, @here or
-individual users; the only ping possible is the one role a staff member picks.
+    Members
+      /manage welcome ...     set, turn off or test the welcome message
+
+    Server
+      /manage status          settings, counts and the next thing due
+      /manage audit           who did what, most recent first
+      /manage setup           staff role, channels, timezone (administrators)
+      /manage fixcommands     re-sync the commands (administrators)
+
+The web dashboard runs in the same process and calls the same operations. See
+``dashboard.py``. ``python bot.py --demo`` runs the dashboard with simulated
+servers and no token.
 """
 
 from __future__ import annotations
 
+import asyncio
+import copy
 import logging
 import sys
 from datetime import datetime, timezone
@@ -32,73 +43,61 @@ import discord
 from discord import app_commands
 from discord.ext import commands, tasks
 
-import announcements
+import announcements as ann
+import audit
 import command_tree
+import events
+import operations as ops
 import paths
+import polls
+import settings
 import store
-from announcements import (
-    MAX_BODY_LENGTH,
-    MAX_TITLE_LENGTH,
-    add_scheduled,
-    build_staff_log_embed,
-    cancel_scheduled,
-    clean_body,
-    clean_title,
-    discord_time,
-    list_history,
-    list_pending,
-    parse_send_time,
-    post_announcement,
-    record_announcement,
-    run_due_scheduled,
-    validate_timezone,
-)
-from command_tree import is_administrator
-from settings import (
-    get_announcement_channel_id,
-    get_guild_config,
-    get_staff_channel_id,
-    get_staff_role_id,
-    get_timezone_name,
-    load_config,
-    resolve_token,
-    save_config,
-    set_guild_value,
-    staff_denial,
-)
+import welcome
+from audit import Actor
+from command_tree import is_administrator, manage_group
+from dashboard import DashboardServer, ensure_dashboard_token
+from discord_gateway import DiscordGateway
+from operations import OperationError
+from settings import DEFAULT_CONFIG, load_config, resolve_token, staff_denial
 
 SCHEDULER_INTERVAL_SECONDS = 30
+MAX_CONTENT_LENGTH = ann.MAX_BODY_LENGTH
+MAX_TITLE_LENGTH = ann.MAX_TITLE_LENGTH
 
 # --------------------------------------------------------------------------- #
 # Logging: stdout (journal / console) and data/bot.log
 # --------------------------------------------------------------------------- #
 logger = logging.getLogger("combat_master")
 logger.setLevel(logging.INFO)
-_formatter = logging.Formatter(
-    "%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-)
+_formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
 _stream = logging.StreamHandler(sys.stdout)
 _stream.setFormatter(_formatter)
 logger.addHandler(_stream)
-try:
-    _file = logging.FileHandler(paths.log_path(), encoding="utf-8")
-    _file.setFormatter(_formatter)
-    logger.addHandler(_file)
-except OSError as exc:  # a broken log file must not stop the bot
-    logger.warning("File logging disabled (%s)", exc)
 
+
+def _attach_file_log() -> None:
+    """Also log to data/bot.log. Called from main(), never on import, so that
+    --demo, --paths and the tests do not create the real data directory."""
+    try:
+        handler = logging.FileHandler(paths.log_path(), encoding="utf-8")
+    except OSError as exc:  # a broken log file must not stop the bot
+        logger.warning("File logging disabled (%s)", exc)
+        return
+    handler.setFormatter(_formatter)
+    logger.addHandler(handler)
+
+# Members are needed for the welcome message. This is a privileged intent:
+# it must also be switched on in the Developer Portal.
 intents = discord.Intents.default()
+intents.members = True
 
 
 class CombatMasterBot(commands.Bot):
     def __init__(self, config: dict[str, Any]) -> None:
-        super().__init__(
-            command_prefix="!",  # unused: slash commands only
-            intents=intents,
-            help_command=None,
-        )
+        super().__init__(command_prefix="!", intents=intents, help_command=None)  # slash commands only
         self.config = config
+        self.gateway = DiscordGateway(self)
+        self.dashboard: Optional[DashboardServer] = None
         self._guild_commands_synced: set[int] = set()
         self._global_registry_cleared = False
 
@@ -109,6 +108,28 @@ class CombatMasterBot(commands.Bot):
         await _register_cog(self)
         if not self.scheduler_tick.is_running():
             self.scheduler_tick.start()
+        await self._start_dashboard()
+
+    async def _start_dashboard(self) -> None:
+        if not self.config.get("dashboard_enabled", True):
+            logger.info("Dashboard disabled (dashboard_enabled is false).")
+            return
+        try:
+            token = ensure_dashboard_token(self.config)
+            self.dashboard = DashboardServer(
+                self.gateway,
+                self.config,
+                token=token,
+                host=str(self.config.get("dashboard_host") or "127.0.0.1"),
+                port=int(self.config.get("dashboard_port") or 8765),
+                allowed_hosts=self.config.get("dashboard_allowed_hosts") or [],
+                trusted_proxies=self.config.get("dashboard_trusted_proxies") or [],
+                secure_cookie=bool(self.config.get("dashboard_secure_cookie")),
+            )
+            await self.dashboard.start()
+        except Exception:  # the bot keeps running without its dashboard
+            logger.exception("Could not start the dashboard; the Discord bot will keep running.")
+            self.dashboard = None
 
     async def on_ready(self) -> None:
         logger.info("Logged in as %s (%s)", self.user, self.user.id if self.user else "?")
@@ -120,9 +141,25 @@ class CombatMasterBot(commands.Bot):
     async def on_guild_join(self, guild: discord.Guild) -> None:
         await self.sync_guild_commands(guild.id)
 
+    async def on_member_join(self, member: discord.Member) -> None:
+        if member.bot:
+            return
+        guild = member.guild
+        await ops.send_welcome(
+            self.gateway,
+            self.config,
+            guild.id,
+            user_id=member.id,
+            user_name=member.display_name,
+            server=guild.name,
+            members=guild.member_count or 0,
+        )
+
     async def close(self) -> None:
         if self.scheduler_tick.is_running():
             self.scheduler_tick.cancel()
+        if self.dashboard is not None:
+            await self.dashboard.close()
         await super().close()
 
     # ------------------------------------------------------------------ #
@@ -131,9 +168,8 @@ class CombatMasterBot(commands.Bot):
     async def _clear_global_registry(self) -> None:
         """Empty Discord's *global* command list.
 
-        The commands are published per server only. A command that lives in
-        both the global and a server registry is listed twice by the Discord
-        client, so the global copy is removed.
+        Commands are published per server only. A command listed in both the
+        global and a server registry shows up twice in the Discord client.
         """
         try:
             await self.http.bulk_upsert_global_commands(self.application_id, payload=[])
@@ -160,12 +196,14 @@ class CombatMasterBot(commands.Bot):
         return len(synced)
 
     # ------------------------------------------------------------------ #
-    # Scheduler
+    # Scheduler: scheduled posts, repeats, poll closes and event reminders
     # ------------------------------------------------------------------ #
     @tasks.loop(seconds=SCHEDULER_INTERVAL_SECONDS)
     async def scheduler_tick(self) -> None:
         try:
-            await run_due_scheduled(datetime.now(timezone.utc), self._deliver_scheduled)
+            counts = await ops.run_scheduler(self.gateway, self.config, now=datetime.now(timezone.utc))
+            if any(counts.values()):
+                logger.info("Scheduler: %s", counts)
         except Exception:  # the loop must survive any single bad tick
             logger.exception("Scheduler tick failed.")
 
@@ -173,135 +211,49 @@ class CombatMasterBot(commands.Bot):
     async def _wait_until_ready(self) -> None:
         await self.wait_until_ready()
 
-    async def _deliver_scheduled(self, row: dict[str, Any]) -> int:
-        """Post one scheduled announcement. Raises if it can not be posted.
 
-        Every failure is also written to the staff log, so a missed
-        announcement is visible to staff without anyone reading bot.log.
-        """
-        guild = self.get_guild(row["guild_id"])
-        if guild is None:
-            raise LookupError("I am no longer in that server.")
-        try:
-            return await self._post_scheduled(guild, row)
-        except Exception as exc:
-            await self._send_staff_log(
-                guild, _failure_embed(row, str(exc) or type(exc).__name__)
-            )
-            raise
+# --------------------------------------------------------------------------- #
+# Helpers for the cog
+# --------------------------------------------------------------------------- #
+def _actor(interaction: discord.Interaction) -> Actor:
+    return Actor(interaction.user.id, interaction.user.display_name, "discord")
 
-    async def _post_scheduled(self, guild: discord.Guild, row: dict[str, Any]) -> int:
-        channel = await _resolve_text_channel(guild, row["channel_id"])
-        if channel is None:
-            raise LookupError("The announcement channel no longer exists.")
-        problem = _channel_problem(channel, guild)
-        if problem:
-            raise PermissionError(problem)
 
-        role = guild.get_role(row["mention_role_id"]) if row["mention_role_id"] else None
-        message = await post_announcement(
-            channel,
-            title=row["title"],
-            body=row["body"],
-            author_name=_member_name(guild, row["author_id"]),
-            mention_role=role,
-        )
-        record_announcement(
-            guild_id=guild.id,
-            channel_id=channel.id,
-            message_id=message.id,
-            author_id=row["author_id"],
-            title=row["title"],
-            body=row["body"],
-            mention_role_id=row["mention_role_id"],
-            source="scheduled",
-        )
-        await self._send_staff_log(
-            guild,
-            build_staff_log_embed(
-                heading="Scheduled announcement posted",
-                channel_mention=channel.mention,
-                author_mention=f"<@{row['author_id']}>",
-                title=row["title"],
-                body=row["body"],
-                mention=role.mention if role else None,
-                source=f"Scheduled #{row['id']}",
-            ),
-        )
-        return message.id
+def _when_text(iso: str) -> str:
+    return ann.discord_time(ann.parse_stored(iso))
 
-    # ------------------------------------------------------------------ #
-    # Staff log
-    # ------------------------------------------------------------------ #
-    async def _send_staff_log(self, guild: discord.Guild, embed: discord.Embed) -> None:
-        """Post in the server's staff log channel. Never raises."""
-        channel_id = get_staff_channel_id(self.config, guild.id)
-        if not channel_id:
-            return
-        channel = await _resolve_text_channel(guild, channel_id)
-        if channel is None:
-            return
-        try:
-            await channel.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
-        except discord.HTTPException as exc:
-            logger.warning("Could not write to the staff log in %s: %s", guild.id, exc)
+
+def _warn_lines(warnings: list[str]) -> list[str]:
+    return [f"⚠️ {w}" for w in warnings]
 
 
 # --------------------------------------------------------------------------- #
-# Helpers shared by the commands and the scheduler
+# Nested groups. Defined at module level, attached to /manage, and bound by the cog below.
 # --------------------------------------------------------------------------- #
-async def _resolve_text_channel(
-    guild: discord.Guild, channel_id: int
-) -> Optional[discord.TextChannel]:
-    channel = guild.get_channel(int(channel_id))
-    if channel is None:
-        try:
-            channel = await guild.fetch_channel(int(channel_id))
-        except discord.HTTPException:
-            return None
-    return channel if isinstance(channel, discord.TextChannel) else None
-
-
-def _channel_problem(channel: discord.TextChannel, guild: discord.Guild) -> Optional[str]:
-    """Why the bot can not post in ``channel``, or ``None`` if it can."""
-    me = guild.me
-    perms = channel.permissions_for(me)
-    if not (perms.view_channel and perms.send_messages):
-        return (
-            f"I can't send messages in {channel.mention}. Grant me View Channel "
-            "and Send Messages there."
-        )
-    if not perms.embed_links:
-        return f"I need Embed Links in {channel.mention} to post announcements."
-    return None
-
-
-def _member_name(guild: discord.Guild, user_id: int) -> str:
-    member = guild.get_member(int(user_id))
-    return member.display_name if member is not None else f"user {user_id}"
-
-
-def _failure_embed(row: dict[str, Any], reason: str) -> discord.Embed:
-    embed = discord.Embed(
-        title="Scheduled announcement failed",
-        description=reason[:500],
-        color=discord.Color.red(),
-        timestamp=datetime.now(timezone.utc),
-    )
-    embed.add_field(name="Channel", value=f"<#{row['channel_id']}>", inline=True)
-    embed.add_field(name="Title", value=row["title"][:1024], inline=False)
-    embed.add_field(name="Source", value=f"Scheduled #{row['id']}", inline=True)
-    return embed
-
-
-def _channel_warnings(channel: discord.TextChannel, guild: discord.Guild, role: Optional[discord.Role]) -> list[str]:
-    notes: list[str] = []
-    if role is not None and not role.mentionable and not channel.permissions_for(guild.me).mention_everyone:
-        notes.append(
-            f"Note: {role.mention} is not mentionable, so it will show but not notify. "
-            "Make the role mentionable or grant me Mention All Roles."
-        )
-    return notes
+template_group = app_commands.Group(
+    name="template",
+    description="Save and reuse announcement text.",
+    parent=manage_group,
+    guild_only=True,
+)
+poll_group = app_commands.Group(
+    name="poll",
+    description="Reaction polls that close themselves.",
+    parent=manage_group,
+    guild_only=True,
+)
+event_group = app_commands.Group(
+    name="event",
+    description="Events with RSVP reactions and reminders.",
+    parent=manage_group,
+    guild_only=True,
+)
+welcome_group = app_commands.Group(
+    name="welcome",
+    description="The message posted when someone joins.",
+    parent=manage_group,
+    guild_only=True,
+)
 
 
 # --------------------------------------------------------------------------- #
@@ -313,96 +265,59 @@ class CombatMasterCog(commands.Cog):
     def __init__(self, bot_: CombatMasterBot) -> None:
         self.bot = bot_
 
-    # The group lives in command_tree.py. Naming it here is what makes this
-    # cog the one that registers /manage with Discord.
+    # Top-level group, and the nested groups from the module above.
     manage_group = command_tree.manage_group
+    template_group = template_group
+    poll_group = poll_group
+    event_group = event_group
+    welcome_group = welcome_group
 
-    # NOTE: Discord rejects the whole command list (HTTP 400, code 50035) if
-    # any command or option description is over 100 characters.
-    # tests/test_commands.py checks every description against that limit.
+    # NOTE: Discord rejects the whole command list (HTTP 400, code 50035) if any
+    # command or option description is over 100 characters. tests/test_commands.py
+    # checks every description against that limit.
 
-    # ---- /manage announce --------------------------------------------- #
+    # ================================================================== #
+    # Announcements
+    # ================================================================== #
     @manage_group.command(name="announce", description="Post an announcement now.")
     @app_commands.describe(
         message="What to announce. Shown inside an embed.",
         title="Optional heading above the message.",
         channel="Where to post. Defaults to the server's announcement channel.",
-        mention="Optional role to ping with the announcement.",
+        mention="Optional role to ping with it.",
+        publish="Also publish to followers (announcement channels only).",
     )
     async def manage_announce(
         self,
         interaction: discord.Interaction,
-        message: app_commands.Range[str, 1, MAX_BODY_LENGTH],
+        message: app_commands.Range[str, 1, MAX_CONTENT_LENGTH],
         title: Optional[app_commands.Range[str, 1, MAX_TITLE_LENGTH]] = None,
         channel: Optional[discord.TextChannel] = None,
         mention: Optional[discord.Role] = None,
+        publish: bool = False,
     ) -> None:
-        if not await self._begin(interaction):
-            return
-        if not await self._require_staff(interaction):
-            return
-        guild = interaction.guild
-        assert guild is not None
-
-        target = channel or await self._configured_channel(guild)
-        if target is None:
-            await self._reply(
-                interaction,
-                "No channel given and no announcement channel is set. Pass `channel:` "
-                "or run `/manage setup announcement_channel:#channel`.",
-            )
-            return
-        problem = _channel_problem(target, guild)
-        if problem:
-            await self._reply(interaction, problem)
+        if not await self._staff(interaction):
             return
         try:
-            cleaned_title = clean_title(title)
-            cleaned_body = clean_body(message)
-        except ValueError as exc:
+            result = await ops.announce_now(
+                self.bot.gateway,
+                self.bot.config,
+                interaction.guild_id,
+                _actor(interaction),
+                message=message,
+                title=title,
+                channel_id=channel.id if channel else None,
+                mention_role_id=mention.id if mention else None,
+                publish=publish,
+            )
+        except OperationError as exc:
             await self._reply(interaction, str(exc))
             return
+        lines = [f"Posted in <#{result['channel_id']}>: {result['jump_url']}"]
+        if publish and result["published"]:
+            lines.append("Published to followers.")
+        await self._reply(interaction, "\n".join(lines + _warn_lines(result["warnings"])))
 
-        try:
-            sent = await post_announcement(
-                target,
-                title=cleaned_title,
-                body=cleaned_body,
-                author_name=interaction.user.display_name,
-                mention_role=mention,
-            )
-        except discord.HTTPException as exc:
-            logger.warning("Announcement in %s failed: %s", target.id, exc)
-            await self._reply(interaction, f"Discord refused the announcement: {exc}")
-            return
-
-        record_announcement(
-            guild_id=guild.id,
-            channel_id=target.id,
-            message_id=sent.id,
-            author_id=interaction.user.id,
-            title=cleaned_title,
-            body=cleaned_body,
-            mention_role_id=mention.id if mention else None,
-            source="now",
-        )
-        await self.bot._send_staff_log(
-            guild,
-            build_staff_log_embed(
-                heading="Announcement posted",
-                channel_mention=target.mention,
-                author_mention=interaction.user.mention,
-                title=cleaned_title,
-                body=cleaned_body,
-                mention=mention.mention if mention else None,
-                source="Now",
-            ),
-        )
-        lines = [f"Posted in {target.mention}: {sent.jump_url}"]
-        lines += _channel_warnings(target, guild, mention)
-        await self._reply(interaction, "\n".join(lines))
-
-    # ---- /manage schedule --------------------------------------------- #
     @manage_group.command(name="schedule", description="Post an announcement at a later time.")
     @app_commands.describe(
         when="A delay like 2h or 1d12h, or a time like 2026-10-20 18:00 (server time).",
@@ -410,198 +325,469 @@ class CombatMasterCog(commands.Cog):
         title="Optional heading above the message.",
         channel="Where to post. Defaults to the server's announcement channel.",
         mention="Optional role to ping when it is posted.",
+        publish="Also publish to followers (announcement channels only).",
     )
     async def manage_schedule(
         self,
         interaction: discord.Interaction,
         when: app_commands.Range[str, 1, 40],
-        message: app_commands.Range[str, 1, MAX_BODY_LENGTH],
+        message: app_commands.Range[str, 1, MAX_CONTENT_LENGTH],
         title: Optional[app_commands.Range[str, 1, MAX_TITLE_LENGTH]] = None,
         channel: Optional[discord.TextChannel] = None,
         mention: Optional[discord.Role] = None,
+        publish: bool = False,
     ) -> None:
-        if not await self._begin(interaction):
+        if not await self._staff(interaction):
             return
-        if not await self._require_staff(interaction):
-            return
-        guild = interaction.guild
-        assert guild is not None
+        await self._schedule(interaction, when, message, title, channel, mention, publish, None)
 
-        target = channel or await self._configured_channel(guild)
-        if target is None:
-            await self._reply(
-                interaction,
-                "No channel given and no announcement channel is set. Pass `channel:` "
-                "or run `/manage setup announcement_channel:#channel`.",
-            )
+    @manage_group.command(name="repeat", description="Post an announcement again and again, on a schedule.")
+    @app_commands.describe(
+        every="How often to post. For example 1d, 12h or 30m (at least 15 minutes).",
+        message="What to announce. Shown inside an embed.",
+        title="Optional heading above the message.",
+        first_in="When the first post goes out, e.g. 1h. Defaults to one interval from now.",
+        channel="Where to post. Defaults to the server's announcement channel.",
+        mention="Optional role to ping each time.",
+        publish="Also publish to followers (announcement channels only).",
+    )
+    async def manage_repeat(
+        self,
+        interaction: discord.Interaction,
+        every: app_commands.Range[str, 1, 20],
+        message: app_commands.Range[str, 1, MAX_CONTENT_LENGTH],
+        title: Optional[app_commands.Range[str, 1, MAX_TITLE_LENGTH]] = None,
+        first_in: Optional[app_commands.Range[str, 1, 40]] = None,
+        channel: Optional[discord.TextChannel] = None,
+        mention: Optional[discord.Role] = None,
+        publish: bool = False,
+    ) -> None:
+        if not await self._staff(interaction):
             return
-        problem = _channel_problem(target, guild)
-        if problem:
-            await self._reply(interaction, problem)
-            return
+        await self._schedule(interaction, first_in or every, message, title, channel, mention, publish, every)
+
+    async def _schedule(self, interaction, when, message, title, channel, mention, publish, repeat_every) -> None:
         try:
-            cleaned_title = clean_title(title)
-            cleaned_body = clean_body(message)
-            send_at = parse_send_time(
-                when,
-                datetime.now(timezone.utc),
-                get_timezone_name(self.bot.config, guild.id),
+            result = await ops.schedule_announcement(
+                self.bot.gateway,
+                self.bot.config,
+                interaction.guild_id,
+                _actor(interaction),
+                when=when,
+                message=message,
+                title=title,
+                channel_id=channel.id if channel else None,
+                mention_role_id=mention.id if mention else None,
+                publish=publish,
+                repeat_every=repeat_every,
             )
-        except ValueError as exc:
+        except OperationError as exc:
             await self._reply(interaction, str(exc))
             return
+        if result["repeat_seconds"]:
+            text = (
+                f"Repeating **#{result['id']}** starts {_when_text(result['send_at'])} "
+                f"in <#{result['channel_id']}>. Cancel it with `/manage cancel` and that number."
+            )
+        else:
+            text = (
+                f"Scheduled **#{result['id']}** for {_when_text(result['send_at'])} "
+                f"in <#{result['channel_id']}>. Cancel it with `/manage cancel` and that number."
+            )
+        await self._reply(interaction, "\n".join([text] + _warn_lines(result["warnings"])))
 
-        schedule_id = add_scheduled(
-            guild_id=guild.id,
-            channel_id=target.id,
-            author_id=interaction.user.id,
-            title=cleaned_title,
-            body=cleaned_body,
-            mention_role_id=mention.id if mention else None,
-            send_at=send_at,
-        )
-        lines = [
-            f"Scheduled **#{schedule_id}** for {discord_time(send_at)} in {target.mention}.",
-            "Use `/manage cancel` with that number to stop it before then.",
-        ]
-        lines += _channel_warnings(target, guild, mention)
-        await self._reply(interaction, "\n".join(lines))
-
-    # ---- /manage scheduled -------------------------------------------- #
     @manage_group.command(name="scheduled", description="List announcements waiting to be posted.")
     async def manage_scheduled(self, interaction: discord.Interaction) -> None:
-        if not await self._begin(interaction):
+        if not await self._staff(interaction):
             return
-        if not await self._require_staff(interaction):
-            return
-        guild = interaction.guild
-        assert guild is not None
-
-        pending = list_pending(guild.id)
+        pending = ops.list_schedule(interaction.guild_id)
         if not pending:
             await self._reply(interaction, "Nothing is scheduled.")
             return
         lines = []
         for row in pending[:25]:
-            when = datetime.fromisoformat(row["send_at"])
+            if row["interval_seconds"]:
+                kind = f"every {_human_seconds(row['interval_seconds'])}"
+            else:
+                kind = "once"
             lines.append(
-                f"**#{row['id']}** · {discord_time(when)} · <#{row['channel_id']}> · {row['title']}"
+                f"**#{row['id']}** · {kind} · next {_when_text(row['send_at'])} · "
+                f"<#{row['channel_id']}> · {row['title']}"
             )
         if len(pending) > 25:
             lines.append(f"...and {len(pending) - 25} more.")
-        embed = discord.Embed(
-            title="Scheduled announcements",
-            description="\n".join(lines),
-            color=announcements.EMBED_COLOR,
-        )
+        embed = discord.Embed(title="Scheduled announcements", description="\n".join(lines), color=ann.EMBED_COLOR)
         await self._reply(interaction, embed=embed)
 
-    # ---- /manage cancel ----------------------------------------------- #
-    @manage_group.command(name="cancel", description="Cancel a scheduled announcement.")
+    @manage_group.command(name="cancel", description="Cancel a scheduled or repeating announcement.")
     @app_commands.describe(schedule_id="The number shown by /manage scheduled.")
     async def manage_cancel(
-        self,
-        interaction: discord.Interaction,
-        schedule_id: app_commands.Range[int, 1, 2_000_000_000],
+        self, interaction: discord.Interaction, schedule_id: app_commands.Range[int, 1, 2_000_000_000]
     ) -> None:
-        if not await self._begin(interaction):
+        if not await self._staff(interaction):
             return
-        if not await self._require_staff(interaction):
+        try:
+            ops.cancel_schedule(interaction.guild_id, _actor(interaction), schedule_id)
+        except OperationError as exc:
+            await self._reply(interaction, str(exc))
             return
-        guild = interaction.guild
-        assert guild is not None
+        await self._reply(interaction, f"Cancelled **#{schedule_id}**.")
 
-        if cancel_scheduled(guild.id, schedule_id):
-            await self._reply(interaction, f"Cancelled scheduled announcement **#{schedule_id}**.")
-        else:
-            await self._reply(
-                interaction,
-                f"No pending scheduled announcement **#{schedule_id}** in this server. "
-                "Check `/manage scheduled`.",
-            )
-
-    # ---- /manage history ---------------------------------------------- #
     @manage_group.command(name="history", description="Show the most recent announcements.")
     @app_commands.describe(limit="How many to show (1-25, default 10).")
     async def manage_history(
-        self,
-        interaction: discord.Interaction,
-        limit: Optional[app_commands.Range[int, 1, 25]] = None,
+        self, interaction: discord.Interaction, limit: Optional[app_commands.Range[int, 1, 25]] = None
     ) -> None:
-        if not await self._begin(interaction):
+        if not await self._staff(interaction):
             return
-        if not await self._require_staff(interaction):
-            return
-        guild = interaction.guild
-        assert guild is not None
-
-        rows = list_history(guild.id, limit or announcements.DEFAULT_HISTORY_LIMIT)
+        rows = ops.list_history(interaction.guild_id, limit or ann.DEFAULT_HISTORY_LIMIT)
         if not rows:
             await self._reply(interaction, "No announcements have been posted yet.")
             return
         lines = []
         for row in rows:
-            when = datetime.fromisoformat(row["created_at"])
-            how = "scheduled" if row["source"] == "scheduled" else "posted"
+            how = {"scheduled": "scheduled", "repeat": "repeated"}.get(row["source"], "posted")
             jump = ""
             if row["message_id"]:
-                jump = f" · [jump](https://discord.com/channels/{guild.id}/{row['channel_id']}/{row['message_id']})"
+                jump = f" · [jump](https://discord.com/channels/{interaction.guild_id}/{row['channel_id']}/{row['message_id']})"
             lines.append(
-                f"{discord_time(when)} · {how} in <#{row['channel_id']}> by <@{row['author_id']}> · "
-                f"**{row['title']}**{jump}"
+                f"{_when_text(row['created_at'])} · {how} in <#{row['channel_id']}> · **{row['title']}**{jump}"
             )
-        embed = discord.Embed(
-            title="Recent announcements",
-            description="\n".join(lines),
-            color=announcements.EMBED_COLOR,
-        )
+        embed = discord.Embed(title="Recent announcements", description="\n".join(lines), color=ann.EMBED_COLOR)
         await self._reply(interaction, embed=embed)
 
-    # ---- /manage status ----------------------------------------------- #
-    @manage_group.command(name="status", description="Show this server's settings and what is pending.")
-    async def manage_status(self, interaction: discord.Interaction) -> None:
-        if not await self._begin(interaction):
+    # ================================================================== #
+    # Templates
+    # ================================================================== #
+    @template_group.command(name="save", description="Save announcement text under a name.")
+    @app_commands.describe(
+        name="A short name, for example raid-night.",
+        message="The text to save.",
+        title="Optional heading.",
+    )
+    async def template_save(
+        self,
+        interaction: discord.Interaction,
+        name: app_commands.Range[str, 1, 40],
+        message: app_commands.Range[str, 1, MAX_CONTENT_LENGTH],
+        title: Optional[app_commands.Range[str, 1, MAX_TITLE_LENGTH]] = None,
+    ) -> None:
+        if not await self._staff(interaction):
             return
-        if not await self._require_staff(interaction):
+        try:
+            result = await ops.save_template(
+                interaction.guild_id, _actor(interaction), name=name, title=title, message=message
+            )
+        except OperationError as exc:
+            await self._reply(interaction, str(exc))
+            return
+        verb = "Updated" if result["updated"] else "Saved"
+        await self._reply(interaction, f"{verb} template `{result['name']}`.")
+
+    @template_group.command(name="list", description="List the saved templates.")
+    async def template_list(self, interaction: discord.Interaction) -> None:
+        if not await self._staff(interaction):
+            return
+        rows = ops.list_templates(interaction.guild_id)
+        if not rows:
+            await self._reply(interaction, "No templates yet. Save one with `/manage template save`.")
+            return
+        lines = [f"`{row['name']}` · {row['title']}" for row in rows]
+        await self._reply(interaction, "\n".join(lines[:50]))
+
+    @template_group.command(name="delete", description="Delete a saved template.")
+    @app_commands.describe(name="The template's name.")
+    async def template_delete(self, interaction: discord.Interaction, name: str) -> None:
+        if not await self._staff(interaction):
+            return
+        try:
+            ops.delete_template(interaction.guild_id, _actor(interaction), name)
+        except OperationError as exc:
+            await self._reply(interaction, str(exc))
+            return
+        await self._reply(interaction, f"Deleted template `{name}`.")
+
+    @template_group.command(name="use", description="Post a saved template now.")
+    @app_commands.describe(
+        name="The template's name.",
+        channel="Where to post. Defaults to the server's announcement channel.",
+        mention="Optional role to ping with it.",
+        publish="Also publish to followers (announcement channels only).",
+    )
+    async def template_use(
+        self,
+        interaction: discord.Interaction,
+        name: str,
+        channel: Optional[discord.TextChannel] = None,
+        mention: Optional[discord.Role] = None,
+        publish: bool = False,
+    ) -> None:
+        if not await self._staff(interaction):
+            return
+        try:
+            result = await ops.use_template(
+                self.bot.gateway,
+                self.bot.config,
+                interaction.guild_id,
+                _actor(interaction),
+                name=name,
+                channel_id=channel.id if channel else None,
+                mention_role_id=mention.id if mention else None,
+                publish=publish,
+            )
+        except OperationError as exc:
+            await self._reply(interaction, str(exc))
+            return
+        await self._reply(
+            interaction,
+            "\n".join([f"Posted template `{name}` in <#{result['channel_id']}>: {result['jump_url']}"]
+                      + _warn_lines(result["warnings"])),
+        )
+
+    # ================================================================== #
+    # Polls
+    # ================================================================== #
+    @poll_group.command(name="create", description="Post a reaction poll.")
+    @app_commands.describe(
+        question="The question to ask.",
+        options="Choices separated by | (2 to 10), for example: Tuesday | Friday.",
+        duration="Optional: how long it stays open, e.g. 2h or 3d. Otherwise close it by hand.",
+        channel="Where to post. Defaults to the server's announcement channel.",
+    )
+    async def poll_create(
+        self,
+        interaction: discord.Interaction,
+        question: app_commands.Range[str, 1, polls.MAX_QUESTION_LENGTH],
+        options: app_commands.Range[str, 1, 1000],
+        duration: Optional[app_commands.Range[str, 1, 20]] = None,
+        channel: Optional[discord.TextChannel] = None,
+    ) -> None:
+        if not await self._staff(interaction):
+            return
+        try:
+            result = await ops.create_poll(
+                self.bot.gateway,
+                self.bot.config,
+                interaction.guild_id,
+                _actor(interaction),
+                question=question,
+                options=options,
+                channel_id=channel.id if channel else None,
+                duration=duration,
+            )
+        except OperationError as exc:
+            await self._reply(interaction, str(exc))
+            return
+        closes = f" It closes {_when_text(result['ends_at'])}." if result["ends_at"] else " Close it with `/manage poll close`."
+        await self._reply(interaction, f"Poll **#{result['id']}** posted in <#{result['channel_id']}>.{closes}")
+
+    @poll_group.command(name="list", description="List recent polls.")
+    async def poll_list(self, interaction: discord.Interaction) -> None:
+        if not await self._staff(interaction):
+            return
+        rows = ops.list_polls(interaction.guild_id)
+        if not rows:
+            await self._reply(interaction, "No polls yet.")
+            return
+        lines = [
+            f"**#{row['id']}** · {row['status']} · {row['question']} · <#{row['channel_id']}>"
+            for row in rows[:25]
+        ]
+        await self._reply(interaction, "\n".join(lines))
+
+    @poll_group.command(name="close", description="Close a poll now and post its results.")
+    @app_commands.describe(poll_id="The number shown by /manage poll list.")
+    async def poll_close(self, interaction: discord.Interaction, poll_id: app_commands.Range[int, 1, 2_000_000_000]) -> None:
+        if not await self._staff(interaction):
+            return
+        try:
+            result = await ops.close_poll(self.bot.gateway, self.bot.config, interaction.guild_id, _actor(interaction), poll_id)
+        except OperationError as exc:
+            await self._reply(interaction, str(exc))
+            return
+        lines = [f"Closed poll **#{result['id']}**: {result['question']}"]
+        for option, count in zip(result["options"], result["votes"]):
+            lines.append(f"{option}: {count}")
+        await self._reply(interaction, "\n".join(lines))
+
+    # ================================================================== #
+    # Events
+    # ================================================================== #
+    @event_group.command(name="create", description="Post an event with an RSVP reaction.")
+    @app_commands.describe(
+        title="The event's name.",
+        starts="A delay like 2h, or a time like 2026-10-20 19:00 (server time).",
+        description="Optional details shown on the event.",
+        channel="Where to post. Defaults to the server's announcement channel.",
+        remind_minutes="Minutes before the start to post a reminder. 0 for none.",
+    )
+    async def event_create(
+        self,
+        interaction: discord.Interaction,
+        title: app_commands.Range[str, 1, events.MAX_TITLE_LENGTH],
+        starts: app_commands.Range[str, 1, 40],
+        description: Optional[app_commands.Range[str, 0, events.MAX_DESCRIPTION_LENGTH]] = None,
+        channel: Optional[discord.TextChannel] = None,
+        remind_minutes: Optional[app_commands.Range[int, 0, events.MAX_REMIND_MINUTES]] = None,
+    ) -> None:
+        if not await self._staff(interaction):
+            return
+        try:
+            result = await ops.create_event(
+                self.bot.gateway,
+                self.bot.config,
+                interaction.guild_id,
+                _actor(interaction),
+                title=title,
+                starts_when=starts,
+                description=description or "",
+                channel_id=channel.id if channel else None,
+                remind_minutes=remind_minutes,
+            )
+        except OperationError as exc:
+            await self._reply(interaction, str(exc))
+            return
+        reminder = f" Reminder {_when_text(result['reminder_at'])}." if result["reminder_at"] else ""
+        await self._reply(
+            interaction,
+            f"Event **#{result['id']}** posted in <#{result['channel_id']}> for {_when_text(result['starts_at'])}.{reminder}",
+        )
+
+    @event_group.command(name="list", description="List upcoming events and their RSVP counts.")
+    async def event_list(self, interaction: discord.Interaction) -> None:
+        if not await self._staff(interaction):
+            return
+        rows = await ops.list_events(self.bot.gateway, interaction.guild_id)
+        if not rows:
+            await self._reply(interaction, "No upcoming events.")
+            return
+        lines = []
+        for row in rows[:25]:
+            going = "?" if row["going"] is None else str(row["going"])
+            lines.append(f"**#{row['id']}** · {row['title']} · {_when_text(row['starts_at'])} · going: {going}")
+        await self._reply(interaction, "\n".join(lines))
+
+    @event_group.command(name="cancel", description="Cancel an upcoming event.")
+    @app_commands.describe(event_id="The number shown by /manage event list.")
+    async def event_cancel(self, interaction: discord.Interaction, event_id: app_commands.Range[int, 1, 2_000_000_000]) -> None:
+        if not await self._staff(interaction):
+            return
+        try:
+            await ops.cancel_event(self.bot.gateway, self.bot.config, interaction.guild_id, _actor(interaction), event_id)
+        except OperationError as exc:
+            await self._reply(interaction, str(exc))
+            return
+        await self._reply(interaction, f"Cancelled event **#{event_id}**.")
+
+    # ================================================================== #
+    # Welcome
+    # ================================================================== #
+    @welcome_group.command(name="set", description="Post a welcome message when members join.")
+    @app_commands.describe(
+        channel="Where to post the welcome.",
+        message="Optional. Use {mention}, {name}, {server} or {members}.",
+    )
+    async def welcome_set(
+        self,
+        interaction: discord.Interaction,
+        channel: discord.TextChannel,
+        message: Optional[app_commands.Range[str, 1, welcome.MAX_TEMPLATE_LENGTH]] = None,
+    ) -> None:
+        if not await self._staff(interaction):
+            return
+        try:
+            await ops.set_welcome(
+                self.bot.gateway,
+                self.bot.config,
+                interaction.guild_id,
+                _actor(interaction),
+                channel_id=channel.id,
+                message=message,
+            )
+        except OperationError as exc:
+            await self._reply(interaction, str(exc))
+            return
+        await self._reply(interaction, f"New members will be welcomed in {channel.mention}.")
+
+    @welcome_group.command(name="off", description="Turn off the welcome message.")
+    async def welcome_off(self, interaction: discord.Interaction) -> None:
+        if not await self._staff(interaction):
+            return
+        ops.disable_welcome(self.bot.config, interaction.guild_id, _actor(interaction))
+        await self._reply(interaction, "Welcome messages are off.")
+
+    @welcome_group.command(name="test", description="Post a sample welcome for yourself.")
+    async def welcome_test(self, interaction: discord.Interaction) -> None:
+        if not await self._staff(interaction):
             return
         guild = interaction.guild
-        assert guild is not None
+        try:
+            result = await ops.send_test_welcome(
+                self.bot.gateway,
+                self.bot.config,
+                interaction.guild_id,
+                _actor(interaction),
+                server=guild.name if guild else "this server",
+                members=(guild.member_count or 0) if guild else 0,
+            )
+        except OperationError as exc:
+            await self._reply(interaction, str(exc))
+            return
+        await self._reply(interaction, f"Sample welcome posted in <#{result['channel_id']}>.")
 
-        cfg = get_guild_config(self.bot.config, guild.id)
-        staff_role_id = get_staff_role_id(self.bot.config, guild.id)
-        pending = list_pending(guild.id)
-        last = list_history(guild.id, 1)
-
-        embed = discord.Embed(title="Combat Master status", color=announcements.EMBED_COLOR)
+    # ================================================================== #
+    # Server
+    # ================================================================== #
+    @manage_group.command(name="status", description="Show this server's settings and what is due next.")
+    async def manage_status(self, interaction: discord.Interaction) -> None:
+        if not await self._staff(interaction):
+            return
+        guild_id = interaction.guild_id
+        cfg = settings.get_guild_config(self.bot.config, guild_id)
+        data = ops.overview(self.bot.config, guild_id)
+        embed = discord.Embed(title="Combat Master status", color=ann.EMBED_COLOR)
         embed.add_field(
             name="Staff role",
-            value=f"<@&{staff_role_id}>" if staff_role_id else "Not set (Manage Server is used)",
+            value=f"<@&{cfg['staff_role_id']}>" if cfg["staff_role_id"] else "Not set (Manage Server is used)",
             inline=False,
         )
-        embed.add_field(
-            name="Announcement channel",
-            value=_or_unset(cfg["announcement_channel_id"]),
-            inline=True,
-        )
+        embed.add_field(name="Announcements", value=_or_unset(cfg["announcement_channel_id"]), inline=True)
         embed.add_field(name="Staff log", value=_or_unset(cfg["staff_channel_id"]), inline=True)
+        embed.add_field(name="Welcome", value=_or_unset(cfg["welcome_channel_id"]), inline=True)
         embed.add_field(name="Timezone", value=cfg["timezone"], inline=True)
-        embed.add_field(name="Scheduled", value=str(len(pending)), inline=True)
         embed.add_field(
-            name="Last announcement",
-            value=(
-                discord_time(datetime.fromisoformat(last[0]["created_at"]))
-                if last
-                else "None yet"
-            ),
+            name="Queued",
+            value=f"{data['scheduled']} scheduled · {data['repeats']} repeating",
             inline=True,
         )
+        embed.add_field(
+            name="Open",
+            value=f"{data['polls_open']} polls · {data['events_upcoming']} upcoming events",
+            inline=True,
+        )
+        embed.add_field(name="Templates", value=str(data["templates"]), inline=True)
         await self._reply(interaction, embed=embed)
 
-    # ---- /manage setup (administrators) ------------------------------- #
-    @manage_group.command(name="setup", description="Set the staff role, channels and timezone.")
+    @manage_group.command(name="audit", description="Show recent staff actions, newest first.")
+    @app_commands.describe(limit="How many to show (1-25, default 10).")
+    async def manage_audit(self, interaction: discord.Interaction, limit: Optional[app_commands.Range[int, 1, 25]] = None) -> None:
+        if not await self._staff(interaction):
+            return
+        rows = audit.list_entries(interaction.guild_id, limit or 10)
+        if not rows:
+            await self._reply(interaction, "Nothing has been recorded yet.")
+            return
+        lines = [
+            f"{_when_text(row['created_at'])} · **{row['actor_name']}** ({row['source']}) · `{row['action']}` {row['detail']}"
+            for row in rows
+        ]
+        embed = discord.Embed(title="Recent staff actions", description="\n".join(lines)[:4000], color=ann.EMBED_COLOR)
+        await self._reply(interaction, embed=embed)
+
+    @manage_group.command(name="setup", description="Set the staff role, channels, timezone and dashboard links.")
     @app_commands.describe(
         staff_role="Members with this role can run /manage commands.",
-        announcement_channel="Default channel for /manage announce and schedule.",
+        announcement_channel="Default channel for announcements, polls and events.",
         staff_channel="Channel that logs everything that is posted.",
         timezone_name="IANA timezone for typed times, e.g. America/Toronto.",
     )
@@ -619,44 +805,25 @@ class CombatMasterCog(commands.Cog):
         if not is_administrator(interaction):
             await self._reply(interaction, "Only administrators can change the setup.")
             return
-        guild = interaction.guild
-        assert guild is not None
-
+        changes: dict[str, Any] = {}
+        if staff_role:
+            changes["staff_role_id"] = staff_role.id
+        if announcement_channel:
+            changes["announcement_channel_id"] = announcement_channel.id
+        if staff_channel:
+            changes["staff_channel_id"] = staff_channel.id
+        if timezone_name:
+            changes["timezone"] = timezone_name
+        if not changes:
+            await self._reply(interaction, "Nothing changed. Pass at least one option to update it.")
+            return
         try:
-            tz_value = validate_timezone(timezone_name) if timezone_name else None
-        except ValueError as exc:
+            await ops.update_settings(self.bot.gateway, self.bot.config, interaction.guild_id, _actor(interaction), changes)
+        except OperationError as exc:
             await self._reply(interaction, str(exc))
             return
+        await self._reply(interaction, "Setup saved. Run `/manage status` to see it all.")
 
-        changes = {
-            "staff_role_id": staff_role.id if staff_role else None,
-            "announcement_channel_id": announcement_channel.id if announcement_channel else None,
-            "staff_channel_id": staff_channel.id if staff_channel else None,
-            "timezone": tz_value,
-        }
-        for key, value in changes.items():
-            if value is not None:
-                set_guild_value(self.bot.config, guild.id, key, value)
-        try:
-            save_config(self.bot.config)
-        except OSError as exc:
-            await self._reply(interaction, f"Could not save the configuration: {exc}")
-            return
-
-        lines = ["Setup saved."]
-        if staff_role:
-            lines.append(f"Staff role: {staff_role.mention}")
-        if announcement_channel:
-            lines.append(f"Announcement channel: {announcement_channel.mention}")
-        if staff_channel:
-            lines.append(f"Staff log: {staff_channel.mention}")
-        if tz_value:
-            lines.append(f"Timezone: {tz_value}")
-        if len(lines) == 1:
-            lines.append("Nothing changed. Pass at least one option to update it.")
-        await self._reply(interaction, "\n".join(lines))
-
-    # ---- /manage fixcommands (administrators) ------------------------- #
     @manage_group.command(name="fixcommands", description="Re-sync this server's /manage commands.")
     async def fixcommands_cmd(self, interaction: discord.Interaction) -> None:
         if not await self._begin(interaction):
@@ -664,19 +831,15 @@ class CombatMasterCog(commands.Cog):
         if not is_administrator(interaction):
             await self._reply(interaction, "Only administrators can re-sync commands.")
             return
-        guild = interaction.guild
-        assert guild is not None
-
-        count = await self.bot.sync_guild_commands(guild.id, force=True)
+        count = await self.bot.sync_guild_commands(interaction.guild_id, force=True)
         await self._reply(
             interaction,
-            f"Re-synced {count} command(s). If Discord still shows duplicates, "
-            "restart the Discord client (Ctrl+R).",
+            f"Re-synced {count} command(s). If Discord still shows duplicates, restart the Discord client (Ctrl+R).",
         )
 
-    # ------------------------------------------------------------------ #
-    # Helpers
-    # ------------------------------------------------------------------ #
+    # ================================================================== #
+    # Shared checks and replies
+    # ================================================================== #
     async def _begin(self, interaction: discord.Interaction) -> bool:
         """Defer the reply (ephemeral) and refuse anything outside a server."""
         try:
@@ -689,40 +852,35 @@ class CombatMasterCog(commands.Cog):
             return False
         return True
 
-    async def _require_staff(self, interaction: discord.Interaction) -> bool:
-        denial = staff_denial(
-            interaction.user,
-            self.bot.config,
-            interaction.guild_id,
-            guild=interaction.guild,
-        )
+    async def _staff(self, interaction: discord.Interaction) -> bool:
+        if not await self._begin(interaction):
+            return False
+        denial = staff_denial(interaction.user, self.bot.config, interaction.guild_id, guild=interaction.guild)
         if denial is None:
             return True
         await self._reply(interaction, denial)
         return False
 
-    async def _configured_channel(self, guild: discord.Guild) -> Optional[discord.TextChannel]:
-        channel_id = get_announcement_channel_id(self.bot.config, guild.id)
-        if not channel_id:
-            return None
-        return await _resolve_text_channel(guild, channel_id)
-
     async def _reply(
-        self,
-        interaction: discord.Interaction,
-        content: Optional[str] = None,
-        *,
-        embed: Optional[discord.Embed] = None,
+        self, interaction: discord.Interaction, content: Optional[str] = None, *, embed: Optional[discord.Embed] = None
     ) -> None:
         """Ephemeral answer to the command. Never raises."""
         try:
             await interaction.followup.send(content, embed=embed, ephemeral=True)
         except discord.HTTPException as exc:
-            logger.warning("Could not reply to /manage command: %s", exc)
+            logger.warning("Could not reply to a /manage command: %s", exc)
 
 
 def _or_unset(value: Any) -> str:
     return f"<#{value}>" if value else "Not set"
+
+
+def _human_seconds(seconds: int) -> str:
+    for unit, size in (("week", 604800), ("day", 86400), ("hour", 3600), ("minute", 60)):
+        if seconds >= size and seconds % size == 0:
+            count = seconds // size
+            return f"{count} {unit}{'s' if count != 1 else ''}"
+    return f"{seconds} seconds"
 
 
 async def _register_cog(bot_: CombatMasterBot) -> None:
@@ -731,18 +889,18 @@ async def _register_cog(bot_: CombatMasterBot) -> None:
 
 
 # --------------------------------------------------------------------------- #
-# Module-level bot (created at import so the command tree can be inspected)
+# Module-level bot. Created at import so the command tree can be inspected.
+# It starts from the defaults; main() loads the live config before anything
+# reads it, so importing this module never touches the data directory.
 # --------------------------------------------------------------------------- #
-bot = CombatMasterBot(load_config())
+bot = CombatMasterBot(copy.deepcopy(DEFAULT_CONFIG))
 
 
 # --------------------------------------------------------------------------- #
 # Slash command error handling
 # --------------------------------------------------------------------------- #
 @bot.tree.error
-async def on_app_command_error(
-    interaction: discord.Interaction, error: app_commands.AppCommandError
-) -> None:
+async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError) -> None:
     if isinstance(error, app_commands.CheckFailure):
         msg = "You don't have permission to run that command."
     elif isinstance(error, app_commands.CommandNotFound):
@@ -770,21 +928,64 @@ async def on_app_command_error(
 # --------------------------------------------------------------------------- #
 # Entry point
 # --------------------------------------------------------------------------- #
+def _help() -> str:
+    return (
+        "usage: python bot.py [--paths | --version | --dashboard-token | --demo [--host H] [--port P] | --check]\n"
+        "  (no option)        run the Discord bot and its dashboard\n"
+        "  --paths            show where this install keeps its files\n"
+        "  --version          show the version\n"
+        "  --dashboard-token  print the dashboard login token (creates one if needed)\n"
+        "  --demo             run the dashboard over simulated servers (no token, no Discord)\n"
+        "  --check            check the configuration without connecting to Discord\n"
+    )
+
+
+def _option(args: list[str], name: str, default: str) -> str:
+    if name in args:
+        index = args.index(name)
+        if index + 1 < len(args):
+            return args[index + 1]
+    return default
+
+
 def main(argv: Optional[list[str]] = None) -> int:
     args = list(sys.argv[1:] if argv is None else argv)
+    if "--help" in args or "-h" in args:
+        print(_help())
+        return 0
     if "--paths" in args:
         print(paths.describe())
         return 0
     if "--version" in args:
         print(paths.app_version())
         return 0
-    if "--help" in args or "-h" in args:
-        print(__doc__)
+    if "--demo" in args:
+        from demo import run_demo
+
+        host = _option(args, "--host", "127.0.0.1")
+        port = int(_option(args, "--port", "8765"))
+        try:
+            asyncio.run(run_demo(host, port))
+        except KeyboardInterrupt:
+            pass
         return 0
 
+    _attach_file_log()
+    bot.config = load_config()
     logger.info("Combat Master %s", paths.app_version())
     logger.info("Data directory: %s", paths.data_dir())
     store.init_db()
+    if "--dashboard-token" in args:
+        print(ensure_dashboard_token(bot.config))
+        return 0
+    if "--check" in args:
+        token = resolve_token(bot.config)
+        print("Token: " + ("set" if token else "MISSING (set DISCORD_TOKEN or bot_token)"))
+        print(f"Dashboard: {'enabled' if bot.config.get('dashboard_enabled', True) else 'disabled'} on "
+              f"{bot.config.get('dashboard_host')}:{bot.config.get('dashboard_port')}")
+        print(f"Configured servers: {len(bot.config.get('guilds') or {})}")
+        return 0 if token else 1
+
     token = resolve_token(bot.config)
     if not token:
         logger.error(
@@ -792,6 +993,8 @@ def main(argv: Optional[list[str]] = None) -> int:
             paths.config_path(),
         )
         return 1
+    if bot.config.get("dashboard_enabled", True):
+        ensure_dashboard_token(bot.config)
     try:
         bot.run(token, log_handler=None)
     except discord.LoginFailure:

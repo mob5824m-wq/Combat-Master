@@ -1,9 +1,13 @@
-"""SQLite access shared by :mod:`bot` and :mod:`announcements`.
+"""SQLite access shared by :mod:`bot`, :mod:`operations` and :mod:`dashboard`.
 
 Deliberately small: one connection per statement, opened ``with
 closing(...)`` so it is always released, rows returned as plain dicts. The
 database path is read from :mod:`paths` on every call, so a test that sets
 ``COMBAT_MASTER_DATA`` before importing is honoured.
+
+Schema changes are additive. Tables are created with ``IF NOT EXISTS`` and
+columns added later are added by :func:`_ensure_columns`, so an existing
+``bot.db`` upgrades in place.
 """
 
 from __future__ import annotations
@@ -16,41 +20,118 @@ import paths
 
 SCHEMA = """
 -- Every announcement that was actually posted, whether sent right away or
--- from the schedule. This is what `/manage history` reads.
+-- from the schedule. This is what history and the dashboard read.
 CREATE TABLE IF NOT EXISTS announcements (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     guild_id        INTEGER NOT NULL,
     channel_id      INTEGER NOT NULL,
     message_id      INTEGER,
     author_id       INTEGER NOT NULL,
+    author_name     TEXT,
     title           TEXT NOT NULL,
     body            TEXT NOT NULL,
     mention_role_id INTEGER,
-    source          TEXT NOT NULL,          -- 'now' or 'scheduled'
+    source          TEXT NOT NULL,          -- now | scheduled | repeat
     created_at      TEXT NOT NULL           -- UTC, ISO 8601
 );
 CREATE INDEX IF NOT EXISTS idx_announcements_guild
     ON announcements (guild_id, created_at DESC);
 
--- Announcements waiting for their send time. The row is the record of truth:
--- it survives a restart, and `status` tells you what happened to it.
+-- Announcements waiting to be posted. interval_seconds is NULL for a one-off
+-- and set for a repeating announcement, which stays 'pending' until cancelled.
 CREATE TABLE IF NOT EXISTS scheduled_announcements (
-    id              INTEGER PRIMARY KEY AUTOINCREMENT,
-    guild_id        INTEGER NOT NULL,
-    channel_id      INTEGER NOT NULL,
-    author_id       INTEGER NOT NULL,
-    title           TEXT NOT NULL,
-    body            TEXT NOT NULL,
-    mention_role_id INTEGER,
-    send_at         TEXT NOT NULL,          -- UTC, ISO 8601
-    status          TEXT NOT NULL DEFAULT 'pending',  -- pending|sent|failed|cancelled
-    error           TEXT,
-    created_at      TEXT NOT NULL,
-    sent_at         TEXT
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    guild_id         INTEGER NOT NULL,
+    channel_id       INTEGER NOT NULL,
+    author_id        INTEGER NOT NULL,
+    author_name      TEXT,
+    title            TEXT NOT NULL,
+    body             TEXT NOT NULL,
+    mention_role_id  INTEGER,
+    publish          INTEGER NOT NULL DEFAULT 0,
+    send_at          TEXT NOT NULL,          -- UTC, the next time it goes out
+    interval_seconds INTEGER,
+    runs             INTEGER NOT NULL DEFAULT 0,
+    status           TEXT NOT NULL DEFAULT 'pending',  -- pending|sent|failed|cancelled
+    error            TEXT,
+    created_at       TEXT NOT NULL,
+    sent_at          TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_scheduled_due
     ON scheduled_announcements (status, send_at);
+
+-- Reusable announcement text. Names are unique per server, ignoring case.
+CREATE TABLE IF NOT EXISTS announcement_templates (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    guild_id    INTEGER NOT NULL,
+    name        TEXT NOT NULL COLLATE NOCASE,
+    title       TEXT NOT NULL,
+    body        TEXT NOT NULL,
+    created_by  INTEGER,
+    created_at  TEXT NOT NULL,
+    updated_at  TEXT NOT NULL,
+    UNIQUE (guild_id, name)
+);
+
+-- Reaction polls. Votes are reactions on the poll message, so the tally is
+-- read from Discord when the poll closes; `results` keeps the final counts.
+CREATE TABLE IF NOT EXISTS polls (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    guild_id    INTEGER NOT NULL,
+    channel_id  INTEGER NOT NULL,
+    message_id  INTEGER,
+    question    TEXT NOT NULL,
+    options     TEXT NOT NULL,              -- JSON list of strings
+    author_id   INTEGER NOT NULL,
+    created_at  TEXT NOT NULL,
+    ends_at     TEXT,                       -- UTC; NULL = closed by hand only
+    status      TEXT NOT NULL DEFAULT 'open',  -- open | closed
+    results     TEXT,                       -- JSON list of vote counts
+    closed_at   TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_polls_guild ON polls (guild_id, status);
+
+-- Events with an RSVP reaction. Reminders are posted once, before start.
+CREATE TABLE IF NOT EXISTS events (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    guild_id        INTEGER NOT NULL,
+    channel_id      INTEGER NOT NULL,
+    message_id      INTEGER,
+    title           TEXT NOT NULL,
+    description     TEXT NOT NULL DEFAULT '',
+    starts_at       TEXT NOT NULL,          -- UTC
+    remind_minutes  INTEGER,                -- NULL = no reminder
+    reminder_at     TEXT,                   -- UTC, derived from starts_at
+    reminded        INTEGER NOT NULL DEFAULT 0,
+    author_id       INTEGER NOT NULL,
+    created_at      TEXT NOT NULL,
+    status          TEXT NOT NULL DEFAULT 'open'   -- open | cancelled
+);
+CREATE INDEX IF NOT EXISTS idx_events_guild ON events (guild_id, status, starts_at);
+
+-- Who changed what. Written by every staff action, from Discord or the
+-- dashboard, and by the scheduler when it posts or closes something.
+CREATE TABLE IF NOT EXISTS audit_log (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    guild_id    INTEGER NOT NULL,
+    actor_id    INTEGER NOT NULL,
+    actor_name  TEXT NOT NULL,
+    source      TEXT NOT NULL,              -- discord | dashboard | system
+    action      TEXT NOT NULL,
+    detail      TEXT NOT NULL DEFAULT '',
+    created_at  TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_audit_guild ON audit_log (guild_id, created_at DESC);
 """
+
+# Columns added after a first release. (table, column, declaration)
+_ADDED_COLUMNS = [
+    ("scheduled_announcements", "publish", "INTEGER NOT NULL DEFAULT 0"),
+    ("scheduled_announcements", "interval_seconds", "INTEGER"),
+    ("scheduled_announcements", "runs", "INTEGER NOT NULL DEFAULT 0"),
+    ("scheduled_announcements", "author_name", "TEXT"),
+    ("announcements", "author_name", "TEXT"),
+]
 
 
 def db_path() -> str:
@@ -63,10 +144,18 @@ def _connect() -> sqlite3.Connection:
     return conn
 
 
+def _ensure_columns(conn: sqlite3.Connection) -> None:
+    for table, column, decl in _ADDED_COLUMNS:
+        existing = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
+        if column not in existing:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
+
+
 def init_db() -> None:
-    """Create the tables if they do not exist yet."""
+    """Create the tables if they do not exist yet, and add any new columns."""
     with closing(_connect()) as conn:
         conn.executescript(SCHEMA)
+        _ensure_columns(conn)
         conn.commit()
 
 

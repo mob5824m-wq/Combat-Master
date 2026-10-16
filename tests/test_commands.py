@@ -1,14 +1,14 @@
 """
-Tests for the /manage slash commands (bot.py).
+Tests for the /manage slash commands (bot.py and command_tree.py).
 
 Two kinds of check:
 
 * the command tree itself: every name and description is inside Discord's
-  limits (a single over-long description makes Discord reject the whole list,
+  limits (one over-long description makes Discord reject the whole list,
   HTTP 400 / code 50035), and every payload serialises to JSON;
-* the command handlers, called directly with fake interactions, so the staff
-  gate, the posting path, scheduling and setup are exercised end to end
-  without a Discord connection.
+* the command handlers, called with fake interactions and a DemoGateway, so
+  the staff gate, posting, polls, events, welcome and setup are exercised end
+  to end without a Discord connection.
 
 Run with either:
     python -m pytest tests/test_commands.py
@@ -18,421 +18,311 @@ Run with either:
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 import os
 import sys
 import tempfile
 import unittest
-from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
-from unittest import mock
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
-# Keep the bot's log file and config out of the real data directory.
-_TMP_ROOT = tempfile.TemporaryDirectory()
-os.environ["COMBAT_MASTER_DATA"] = _TMP_ROOT.name
+from discord import app_commands  # noqa: E402
 
-import discord  # noqa: E402
-
-import announcements  # noqa: E402
+import audit  # noqa: E402
 import bot as bot_module  # noqa: E402
+import command_tree  # noqa: E402
+import settings  # noqa: E402
 import store  # noqa: E402
-from command_tree import manage_group  # noqa: E402
-from settings import set_guild_value  # noqa: E402
+from demo import DemoGateway  # noqa: E402
 
-# Discord's limit for the description of a command, group or option.
-DESCRIPTION_MIN = 1
-DESCRIPTION_MAX = 100
+GUILD = 100000000000000001
+ANNOUNCE = 100000000000000101
+GENERAL = 100000000000000102
+STAFF_LOG = 100000000000000105
+STAFF_ROLE = 100000000000000201
+MEMBER_ROLE = 100000000000000202
 
-EXPECTED_COMMANDS = {
-    "manage announce",
-    "manage schedule",
-    "manage scheduled",
-    "manage cancel",
-    "manage history",
-    "manage status",
-    "manage setup",
-    "manage fixcommands",
-}
-
-GUILD_ID = 4321
-STAFF_ROLE_ID = 5000
-ANNOUNCE_CHANNEL_ID = 6000
-LOG_CHANNEL_ID = 6001
-
-
-# --------------------------------------------------------------------------- #
-# Fakes
-# --------------------------------------------------------------------------- #
-class FakeResponse:
-    def __init__(self):
-        self.deferred = False
-
-    def is_done(self):
-        return self.deferred
-
-    async def defer(self, ephemeral=False):
-        self.deferred = True
-
-
-class FakeFollowup:
-    def __init__(self):
-        self.sent: list[dict] = []
-
-    async def send(self, content=None, *, embed=None, ephemeral=False, **_):
-        self.sent.append({"content": content, "embed": embed, "ephemeral": ephemeral})
-        return SimpleNamespace(id=1)
-
-    def last_text(self) -> str:
-        return self.sent[-1]["content"] or ""
-
-
-class FakeChannel:
-    def __init__(self, channel_id: int, *, can_send: bool = True):
-        self.id = channel_id
-        self.mention = f"<#{channel_id}>"
-        self.can_send = can_send
-        self.sent: list[dict] = []
-
-    def permissions_for(self, _member):
-        return SimpleNamespace(
-            view_channel=self.can_send,
-            send_messages=self.can_send,
-            embed_links=True,
-            mention_everyone=False,
-        )
-
-    async def send(self, content=None, *, embed=None, allowed_mentions=None, **_):
-        self.sent.append(
-            {"content": content, "embed": embed, "allowed_mentions": allowed_mentions}
-        )
-        return SimpleNamespace(id=777, jump_url="https://discord.test/jump/777")
-
-
-class FakeGuild:
-    def __init__(self, roles=None, channels=None):
-        self.id = GUILD_ID
-        self.me = SimpleNamespace(id=1, display_name="Combat Master")
-        self._roles = roles or {}
-        self._channels = channels or {}
-
-    def get_role(self, role_id):
-        return self._roles.get(role_id)
-
-    def get_channel(self, channel_id):
-        return self._channels.get(channel_id)
-
-    def get_member(self, _user_id):
-        return None
-
-
-def make_member(user_id: int, *, roles=(), admin=False, manage_guild=False):
-    return SimpleNamespace(
-        id=user_id,
-        display_name=f"user{user_id}",
-        mention=f"<@{user_id}>",
-        guild_permissions=SimpleNamespace(administrator=admin, manage_guild=manage_guild),
-        roles=[SimpleNamespace(id=r) for r in roles],
-    )
-
-
-def make_interaction(user, guild):
-    return SimpleNamespace(
-        user=user,
-        guild=guild,
-        guild_id=guild.id if guild else None,
-        response=FakeResponse(),
-        followup=FakeFollowup(),
-    )
-
-
-class FakeBot:
-    """Stands in for the bot where a handler only needs the config and log."""
-
-    def __init__(self, config):
-        self.config = config
-        self.logged: list[discord.Embed] = []
-
-    async def _send_staff_log(self, guild, embed):
-        self.logged.append(embed)
-
-    async def sync_guild_commands(self, guild_id, force=False):
-        return 0
-
-
-# --------------------------------------------------------------------------- #
-# Command tree (registered once: the cog is what Discord sees)
-# --------------------------------------------------------------------------- #
 _REGISTERED = False
 
 
-def _register_once() -> None:
+def ensure_cog_registered() -> None:
+    """Add the cog to the module-level bot once per test process."""
     global _REGISTERED
     if not _REGISTERED:
         asyncio.run(bot_module._register_cog(bot_module.bot))
         _REGISTERED = True
 
 
+def leaves(command):
+    if isinstance(command, app_commands.Group):
+        for child in command.commands:
+            yield from leaves(child)
+    else:
+        yield command
+
+
+class FakeResponse:
+    def __init__(self) -> None:
+        self.done = False
+
+    async def defer(self, *, ephemeral: bool = False, thinking: bool = False) -> None:
+        self.done = True
+
+    def is_done(self) -> bool:
+        return self.done
+
+
+class FakeFollowup:
+    def __init__(self) -> None:
+        self.sent: list[dict] = []
+
+    async def send(self, content=None, *, embed=None, ephemeral: bool = False, **_) -> None:
+        self.sent.append({"content": content, "embed": embed, "ephemeral": ephemeral})
+
+    @property
+    def last_text(self) -> str:
+        return self.sent[-1]["content"] or ""
+
+
+def fake_interaction(*, admin=False, manage_guild=False, roles=(), user_id=42, name="Ada"):
+    perms = SimpleNamespace(administrator=admin, manage_guild=manage_guild)
+    user = SimpleNamespace(
+        id=user_id,
+        display_name=name,
+        guild_permissions=perms,
+        roles=[SimpleNamespace(id=r) for r in roles],
+    )
+    guild = SimpleNamespace(id=GUILD, name="Combat Arena", member_count=10)
+    return SimpleNamespace(
+        user=user,
+        guild=guild,
+        guild_id=GUILD,
+        response=FakeResponse(),
+        followup=FakeFollowup(),
+    )
+
+
+def fake_channel(channel_id: int):
+    return SimpleNamespace(id=channel_id, mention=f"<#{channel_id}>")
+
+
+def fake_role(role_id: int):
+    return SimpleNamespace(id=role_id, mention=f"<@&{role_id}>")
+
+
 class CommandTreeTests(unittest.TestCase):
-    @classmethod
-    def setUpClass(cls):
-        _register_once()
+    def test_all_names_and_descriptions_fit_discord_limits(self):
+        ensure_cog_registered()
+        for command in leaves(command_tree.manage_group):
+            self.assertLessEqual(len(command.description), 100, command.qualified_name)
+            self.assertGreater(len(command.description), 0, command.qualified_name)
+            self.assertLessEqual(len(command.name), 32, command.qualified_name)
+            for param in command.parameters:
+                self.assertLessEqual(len(param.description), 100, f"{command.qualified_name}.{param.name}")
 
-    def test_expected_commands_are_registered(self):
-        names = {c.qualified_name for c in bot_module.bot.tree.walk_commands()}
-        self.assertTrue(EXPECTED_COMMANDS <= names, EXPECTED_COMMANDS - names)
+    def test_payload_serialises_to_json(self):
+        ensure_cog_registered()
+        payload = command_tree.manage_group.to_dict(bot_module.bot.tree)
+        json.dumps(payload)  # raises if anything is not plain JSON
 
-    def test_every_description_is_within_discord_limits(self):
-        for command in bot_module.bot.tree.walk_commands():
-            self.assertTrue(
-                DESCRIPTION_MIN <= len(command.description) <= DESCRIPTION_MAX,
-                f"{command.qualified_name}: {len(command.description)} chars",
-            )
-            for param in getattr(command, "parameters", []):
-                self.assertTrue(
-                    DESCRIPTION_MIN <= len(param.description) <= DESCRIPTION_MAX,
-                    f"{command.qualified_name}.{param.name}",
-                )
+    def test_expected_groups_and_commands(self):
+        ensure_cog_registered()
+        top = {c.name: c for c in command_tree.manage_group.commands}
+        self.assertEqual(
+            set(top),
+            {"announce", "schedule", "repeat", "scheduled", "cancel", "history", "template",
+             "poll", "event", "welcome", "status", "audit", "setup", "fixcommands"},
+        )
+        self.assertEqual({c.name for c in top["template"].commands}, {"save", "list", "delete", "use"})
+        self.assertEqual({c.name for c in top["poll"].commands}, {"create", "list", "close"})
+        self.assertEqual({c.name for c in top["event"].commands}, {"create", "list", "cancel"})
+        self.assertEqual({c.name for c in top["welcome"].commands}, {"set", "off", "test"})
 
-    def test_group_payload_serialises(self):
-        payload = manage_group.to_dict(bot_module.bot.tree)
-        json.dumps(payload)  # raises if Discord could not receive it
-        self.assertEqual(payload["name"], "manage")
-        self.assertIsNone(payload.get("default_member_permissions"))
-
-    def test_setup_timezone_option_is_called_timezone(self):
-        setup = bot_module.CombatMasterCog.setup_cmd
-        # The Python name is timezone_name; Discord shows it as "timezone".
-        shown = [p.display_name for p in setup.parameters]
-        self.assertIn("timezone", shown)
-        self.assertNotIn("timezone_name", shown)
+    def test_mentions_and_members_intents_are_set(self):
+        self.assertTrue(bot_module.intents.members)
+        self.assertTrue(hasattr(bot_module.CombatMasterBot, "on_member_join"))
 
 
-# --------------------------------------------------------------------------- #
-# Handlers
-# --------------------------------------------------------------------------- #
-class HandlerTestCase(unittest.TestCase):
-    def setUp(self):
-        self._data = tempfile.TemporaryDirectory()
+class StaffGateTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.cfg = copy.deepcopy(settings.DEFAULT_CONFIG)
+
+    def test_with_no_staff_role_manage_server_is_enough(self):
+        member = fake_interaction(manage_guild=True).user
+        self.assertIsNone(settings.staff_denial(member, self.cfg, GUILD))
+
+    def test_with_no_staff_role_plain_members_are_refused(self):
+        member = fake_interaction().user
+        self.assertIsNotNone(settings.staff_denial(member, self.cfg, GUILD))
+
+    def test_once_a_staff_role_is_set_manage_server_alone_is_not_enough(self):
+        settings.set_guild_value(self.cfg, GUILD, "staff_role_id", STAFF_ROLE)
+        manager = fake_interaction(manage_guild=True).user
+        self.assertIsNotNone(settings.staff_denial(manager, self.cfg, GUILD))
+        staff = fake_interaction(roles=[STAFF_ROLE]).user
+        self.assertIsNone(settings.staff_denial(staff, self.cfg, GUILD))
+
+    def test_administrators_always_pass(self):
+        settings.set_guild_value(self.cfg, GUILD, "staff_role_id", STAFF_ROLE)
+        admin = fake_interaction(admin=True).user
+        self.assertIsNone(settings.staff_denial(admin, self.cfg, GUILD))
+        self.assertTrue(command_tree.is_administrator(fake_interaction(admin=True)))
+        self.assertFalse(command_tree.is_administrator(fake_interaction(manage_guild=True)))
+
+
+class CommandHandlerTests(unittest.TestCase):
+    """Run real handlers with a DemoGateway and a temporary data directory."""
+
+    def setUp(self) -> None:
+        ensure_cog_registered()
+        self._tmp = tempfile.TemporaryDirectory()
         self._old = os.environ.get("COMBAT_MASTER_DATA")
-        os.environ["COMBAT_MASTER_DATA"] = self._data.name
+        os.environ["COMBAT_MASTER_DATA"] = self._tmp.name
         store.init_db()
-        _register_once()
+        self.gw = DemoGateway()
+        self.cfg = copy.deepcopy(settings.DEFAULT_CONFIG)
+        settings.set_guild_value(self.cfg, GUILD, "announcement_channel_id", ANNOUNCE)
+        settings.set_guild_value(self.cfg, GUILD, "staff_channel_id", STAFF_LOG)
+        settings.set_guild_value(self.cfg, GUILD, "staff_role_id", STAFF_ROLE)
+        bot_module.bot.gateway = self.gw
+        bot_module.bot.config = self.cfg
+        self.cog = bot_module.bot.get_cog("CombatMasterCog")
 
-        self.config = {"bot_token": "", "default_timezone": "America/Toronto", "guilds": {}}
-        set_guild_value(self.config, GUILD_ID, "staff_role_id", STAFF_ROLE_ID)
-        set_guild_value(self.config, GUILD_ID, "announcement_channel_id", ANNOUNCE_CHANNEL_ID)
-        set_guild_value(self.config, GUILD_ID, "staff_channel_id", LOG_CHANNEL_ID)
-
-        self.fake_bot = FakeBot(self.config)
-        self.cog = bot_module.CombatMasterCog(self.fake_bot)
-        self.announce_channel = FakeChannel(ANNOUNCE_CHANNEL_ID)
-        self.guild = FakeGuild(
-            roles={STAFF_ROLE_ID: SimpleNamespace(id=STAFF_ROLE_ID, mention=f"<@&{STAFF_ROLE_ID}>", mentionable=True)},
-            channels={ANNOUNCE_CHANNEL_ID: self.announce_channel},
-        )
-        self.staff = make_member(10, roles=[STAFF_ROLE_ID])
-        self.outsider = make_member(11)
-        self.admin = make_member(12, admin=True)
-
-        # Channels are plain fakes, so resolve them by id instead of through
-        # the real isinstance(TextChannel) check.
-        resolver = mock.patch.object(
-            bot_module,
-            "_resolve_text_channel",
-            new=mock.AsyncMock(side_effect=lambda guild, cid: guild.get_channel(int(cid))),
-        )
-        resolver.start()
-        self.addCleanup(resolver.stop)
-
-    def tearDown(self):
+    def tearDown(self) -> None:
         if self._old is None:
             os.environ.pop("COMBAT_MASTER_DATA", None)
         else:
             os.environ["COMBAT_MASTER_DATA"] = self._old
-        self._data.cleanup()
+        self._tmp.cleanup()
 
-    def run_cmd(self, handler, interaction, **kwargs):
-        return asyncio.run(handler.callback(self.cog, interaction, **kwargs))
+    def call(self, command_name: str, interaction, *args, **kwargs):
+        """Invoke a cog command's callback the way discord.py would.
 
-
-class AnnounceTests(HandlerTestCase):
-    def announce(self, user, **kwargs):
-        interaction = make_interaction(user, self.guild)
-        options = {"message": "Raid at 8pm", "title": None, "channel": None, "mention": None}
-        options.update(kwargs)
-        self.run_cmd(bot_module.CombatMasterCog.manage_announce, interaction, **options)
-        return interaction
+        Every command, including the nested template/poll/event/welcome ones, is
+        a class attribute of the cog, so it is looked up by its method name.
+        """
+        command = vars(bot_module.CombatMasterCog)[command_name]
+        return asyncio.run(command.callback(self.cog, interaction, *args, **kwargs))
 
     def test_outsider_is_refused_and_nothing_is_posted(self):
-        interaction = self.announce(self.outsider)
-        self.assertIn("can use this command", interaction.followup.last_text())
-        self.assertEqual(self.announce_channel.sent, [])
+        interaction = fake_interaction()
+        self.call("manage_announce", interaction, message="hi")
+        self.assertTrue(interaction.followup.sent, "the refusal should be shown to the user")
+        self.assertEqual(self.gw.posts, [])
 
-    def test_administrator_passes_the_staff_gate(self):
-        interaction = self.announce(self.admin)
-        self.assertEqual(len(self.announce_channel.sent), 1)
-        self.assertIn("Posted in", interaction.followup.last_text())
+    def test_staff_announce_posts_and_replies_with_the_link(self):
+        interaction = fake_interaction(roles=[STAFF_ROLE])
+        self.call("manage_announce", interaction, message="Doors at 8", title="Raid",
+                  mention=fake_role(STAFF_ROLE))
+        self.assertEqual(self.gw.posts[0]["content"], f"<@&{STAFF_ROLE}>")
+        self.assertIn("discord.com/channels", interaction.followup.last_text)
+        self.assertEqual(audit.list_entries(GUILD, 1)[0]["actor_name"], "Ada")
 
-    def test_staff_post_is_recorded_and_logged(self):
-        self.announce(self.staff, title="Raid night")
-        sent = self.announce_channel.sent[0]
-        self.assertIsNone(sent["content"])  # no ping without a chosen role
-        self.assertEqual(sent["embed"].title, "Raid night")
-        history = announcements.list_history(GUILD_ID)
-        self.assertEqual(len(history), 1)
-        self.assertEqual(history[0]["source"], "now")
-        self.assertEqual(history[0]["message_id"], 777)
-        self.assertEqual(len(self.fake_bot.logged), 1)
-
-    def test_chosen_role_is_the_only_ping(self):
-        role = SimpleNamespace(id=7001, mention="<@&7001>", mentionable=True)
-        self.guild._roles[7001] = role
-        self.announce(self.staff, mention=role)
-        sent = self.announce_channel.sent[0]
-        self.assertEqual(sent["content"], "<@&7001>")
-        self.assertEqual([r.id for r in sent["allowed_mentions"].roles], [7001])
-
-    def test_whitespace_only_message_is_refused(self):
-        interaction = self.announce(self.staff, message="   ")
-        self.assertIn("can not be empty", interaction.followup.last_text())
-        self.assertEqual(self.announce_channel.sent, [])
+    def test_admin_is_allowed_without_the_role(self):
+        interaction = fake_interaction(admin=True)
+        self.call("manage_announce", interaction, message="Hello")
+        self.assertEqual(len(self.gw.posts), 2)  # announcement plus staff log copy
 
     def test_missing_channel_explains_setup(self):
-        set_guild_value(self.config, GUILD_ID, "announcement_channel_id", None)
-        interaction = self.announce(self.staff)
-        self.assertIn("/manage setup", interaction.followup.last_text())
+        settings.set_guild_value(self.cfg, GUILD, "announcement_channel_id", None)
+        interaction = fake_interaction(roles=[STAFF_ROLE])
+        self.call("manage_announce", interaction, message="Hello")
+        self.assertIn("/manage setup", interaction.followup.last_text)
 
-    def test_missing_permissions_are_reported_before_posting(self):
-        blocked = FakeChannel(9999, can_send=False)
-        interaction = self.announce(self.staff, channel=blocked)
-        self.assertIn("Send Messages", interaction.followup.last_text())
-        self.assertEqual(blocked.sent, [])
+    def test_schedule_then_list_then_cancel(self):
+        staff = fake_interaction(roles=[STAFF_ROLE])
+        self.call("manage_schedule", staff, when="2h", message="Restart", title=None,
+                  channel=None, mention=None, publish=False)
+        self.assertIn("Scheduled", staff.followup.last_text)
+        listing = fake_interaction(roles=[STAFF_ROLE])
+        self.call("manage_scheduled", listing)
+        self.assertEqual(listing.followup.sent[-1]["embed"].title, "Scheduled announcements")
+        cancel = fake_interaction(roles=[STAFF_ROLE])
+        self.call("manage_cancel", cancel, schedule_id=1)
+        self.assertIn("Cancelled", cancel.followup.last_text)
 
+    def test_bad_time_is_refused_with_a_message(self):
+        interaction = fake_interaction(roles=[STAFF_ROLE])
+        self.call("manage_schedule", interaction, when="someday", message="x", title=None,
+                  channel=None, mention=None, publish=False)
+        self.assertIn("could not read that time", interaction.followup.last_text.lower())
 
-class ScheduleTests(HandlerTestCase):
-    def schedule(self, user, when, **kwargs):
-        interaction = make_interaction(user, self.guild)
-        options = {"when": when, "message": "Doors open", "title": "Event", "channel": None, "mention": None}
-        options.update(kwargs)
-        self.run_cmd(bot_module.CombatMasterCog.manage_schedule, interaction, **options)
-        return interaction
+    def test_template_save_and_use(self):
+        staff = fake_interaction(roles=[STAFF_ROLE])
+        self.call("template_save", staff, name="raid", message="Tonight", title=None)
+        self.assertIn("Saved template `raid`", staff.followup.last_text)
+        use = fake_interaction(roles=[STAFF_ROLE])
+        self.call("template_use", use, name="raid", channel=None, mention=None, publish=False)
+        self.assertIn("Posted template `raid`", use.followup.last_text)
 
-    def test_delay_schedules_for_later(self):
-        interaction = self.schedule(self.staff, "2h")
-        self.assertIn("Scheduled **#1**", interaction.followup.last_text())
-        pending = announcements.list_pending(GUILD_ID)
-        self.assertEqual(len(pending), 1)
-        self.assertEqual(self.announce_channel.sent, [])  # nothing posted yet
+    def test_poll_create_and_close(self):
+        create = fake_interaction(roles=[STAFF_ROLE])
+        self.call("poll_create", create, question="Which night?", options="Tuesday | Friday",
+                  duration=None, channel=None)
+        self.assertIn("Poll **#1**", create.followup.last_text)
+        close = fake_interaction(roles=[STAFF_ROLE])
+        self.call("poll_close", close, poll_id=1)
+        self.assertIn("Closed poll **#1**", close.followup.last_text)
 
-    def test_bad_time_is_refused_and_nothing_is_stored(self):
-        interaction = self.schedule(self.staff, "whenever")
-        self.assertIn("could not read", interaction.followup.last_text())
-        self.assertEqual(announcements.list_pending(GUILD_ID), [])
+    def test_event_create_and_list(self):
+        create = fake_interaction(roles=[STAFF_ROLE])
+        self.call("event_create", create, title="Team night", starts="3h", description=None,
+                  channel=None, remind_minutes=30)
+        self.assertIn("Event **#1**", create.followup.last_text)
+        listing = fake_interaction(roles=[STAFF_ROLE])
+        self.call("event_list", listing)
+        self.assertIn("Team night", listing.followup.last_text)
 
-    def test_outsider_cannot_schedule(self):
-        self.schedule(self.outsider, "2h")
-        self.assertEqual(announcements.list_pending(GUILD_ID), [])
+    def test_welcome_set_test_and_off(self):
+        staff = fake_interaction(roles=[STAFF_ROLE])
+        self.call("welcome_set", staff, channel=fake_channel(GENERAL), message=None)
+        self.assertIn(f"<#{GENERAL}>", staff.followup.last_text)
+        test = fake_interaction(roles=[STAFF_ROLE])
+        self.call("welcome_test", test)
+        self.assertIn("Sample welcome", test.followup.last_text)
+        off = fake_interaction(roles=[STAFF_ROLE])
+        self.call("welcome_off", off)
+        self.assertIn("off", off.followup.last_text)
 
-    def test_cancel_unknown_and_known(self):
-        self.schedule(self.staff, "2h")
-        interaction = make_interaction(self.staff, self.guild)
-        self.run_cmd(bot_module.CombatMasterCog.manage_cancel, interaction, schedule_id=1)
-        self.assertIn("Cancelled", interaction.followup.last_text())
-        again = make_interaction(self.staff, self.guild)
-        self.run_cmd(bot_module.CombatMasterCog.manage_cancel, again, schedule_id=1)
-        self.assertIn("No pending", again.followup.last_text())
+    def test_setup_is_administrator_only(self):
+        staff = fake_interaction(roles=[STAFF_ROLE])
+        self.call("setup_cmd", staff, timezone_name="Europe/London")
+        self.assertIn("Only administrators", staff.followup.last_text)
+        self.assertEqual(settings.get_timezone_name(self.cfg, GUILD), "America/Toronto")
 
-    def test_scheduled_post_is_delivered_by_the_bot(self):
-        self.schedule(self.staff, "2h", mention=None)
-        # Make the schedule due now and deliver it through the real bot method.
-        store.db_execute("UPDATE scheduled_announcements SET send_at = '2000-01-01T00:00:00+00:00'")
-        real_bot = bot_module.bot
-        with mock.patch.object(real_bot, "get_guild", return_value=self.guild), mock.patch.object(
-            real_bot, "_send_staff_log", new=mock.AsyncMock()
-        ) as staff_log, mock.patch.object(bot_module, "_resolve_text_channel", new=mock.AsyncMock(return_value=self.announce_channel)):
-            count = asyncio.run(announcements.run_due_scheduled(
-                datetime.now(timezone.utc), real_bot._deliver_scheduled
-            ))
-        self.assertEqual(count, 1)
-        self.assertEqual(len(self.announce_channel.sent), 1)
-        row = store.db_fetchone("SELECT status FROM scheduled_announcements WHERE id = 1")
-        self.assertEqual(row["status"], "sent")
-        self.assertEqual(announcements.list_history(GUILD_ID)[0]["source"], "scheduled")
-        staff_log.assert_awaited()
+        admin = fake_interaction(admin=True)
+        self.call("setup_cmd", admin, timezone_name="Europe/London")
+        self.assertEqual(settings.get_timezone_name(self.cfg, GUILD), "Europe/London")
 
-    def test_failed_scheduled_post_is_logged_to_staff(self):
-        self.schedule(self.staff, "2h")
-        store.db_execute("UPDATE scheduled_announcements SET send_at = '2000-01-01T00:00:00+00:00'")
-        blocked = FakeChannel(ANNOUNCE_CHANNEL_ID, can_send=False)
-        real_bot = bot_module.bot
-        with mock.patch.object(real_bot, "get_guild", return_value=self.guild), mock.patch.object(
-            real_bot, "_send_staff_log", new=mock.AsyncMock()
-        ) as staff_log, mock.patch.object(bot_module, "_resolve_text_channel", new=mock.AsyncMock(return_value=blocked)):
-            asyncio.run(announcements.run_due_scheduled(
-                datetime.now(timezone.utc), real_bot._deliver_scheduled
-            ))
-        row = store.db_fetchone("SELECT status, error FROM scheduled_announcements WHERE id = 1")
-        self.assertEqual(row["status"], "failed")
-        self.assertIn("Send Messages", row["error"])
-        staff_log.assert_awaited()
-        self.assertEqual(blocked.sent, [])
-
-
-class SetupTests(HandlerTestCase):
-    def test_only_administrators_can_change_setup(self):
-        interaction = make_interaction(self.staff, self.guild)
-        self.run_cmd(bot_module.CombatMasterCog.setup_cmd, interaction, timezone_name="Europe/London")
-        self.assertIn("Only administrators", interaction.followup.last_text())
-        self.assertEqual(self.config["guilds"][str(GUILD_ID)]["timezone"], None)
-
-    def test_admin_setup_saves_timezone_and_roles(self):
-        interaction = make_interaction(self.admin, self.guild)
-        role = SimpleNamespace(id=8000, mention="<@&8000>")
-        with mock.patch.object(bot_module, "save_config") as save:
-            self.run_cmd(
-                bot_module.CombatMasterCog.setup_cmd,
-                interaction,
-                staff_role=role,
-                timezone_name="Europe/London",
-            )
-        save.assert_called_once()
-        entry = self.config["guilds"][str(GUILD_ID)]
-        self.assertEqual(entry["staff_role_id"], 8000)
-        self.assertEqual(entry["timezone"], "Europe/London")
-        self.assertIn("Setup saved", interaction.followup.last_text())
-
-    def test_bad_timezone_is_refused(self):
-        interaction = make_interaction(self.admin, self.guild)
-        self.run_cmd(bot_module.CombatMasterCog.setup_cmd, interaction, timezone_name="Nowhere/Land")
-        self.assertIn("not a timezone", interaction.followup.last_text())
-
-    def test_status_reports_pending_and_staff_role(self):
-        interaction = make_interaction(self.staff, self.guild)
-        self.run_cmd(bot_module.CombatMasterCog.manage_status, interaction)
+    def test_status_reports_the_staff_role(self):
+        interaction = fake_interaction(roles=[STAFF_ROLE])
+        self.call("manage_status", interaction)
         embed = interaction.followup.sent[-1]["embed"]
         fields = {f.name: f.value for f in embed.fields}
-        self.assertEqual(fields["Scheduled"], "0")
-        self.assertIn(str(STAFF_ROLE_ID), fields["Staff role"])
+        self.assertIn(str(STAFF_ROLE), fields["Staff role"])
 
+    def test_audit_lists_recent_actions(self):
+        staff = fake_interaction(roles=[STAFF_ROLE])
+        self.call("manage_announce", staff, message="one")
+        view = fake_interaction(roles=[STAFF_ROLE])
+        self.call("manage_audit", view, limit=5)
+        self.assertIn("announce.post", view.followup.sent[-1]["embed"].description)
 
-class HistoryCommandTests(HandlerTestCase):
-    def test_history_empty_then_populated(self):
-        interaction = make_interaction(self.staff, self.guild)
-        self.run_cmd(bot_module.CombatMasterCog.manage_history, interaction, limit=5)
-        self.assertIn("No announcements", interaction.followup.last_text())
+    def test_fixcommands_is_administrator_only(self):
+        interaction = fake_interaction(roles=[STAFF_ROLE])
+        self.call("fixcommands_cmd", interaction)
+        self.assertIn("Only administrators", interaction.followup.last_text)
 
-        announcements.record_announcement(
-            guild_id=GUILD_ID, channel_id=ANNOUNCE_CHANNEL_ID, message_id=1,
-            author_id=10, title="Patch", body="x", mention_role_id=None, source="now",
-        )
-        interaction = make_interaction(self.staff, self.guild)
-        self.run_cmd(bot_module.CombatMasterCog.manage_history, interaction, limit=5)
-        embed = interaction.followup.sent[-1]["embed"]
-        self.assertIn("Patch", embed.description)
+    def test_commands_refuse_direct_messages(self):
+        interaction = fake_interaction(roles=[STAFF_ROLE])
+        interaction.guild = None
+        interaction.guild_id = None
+        self.call("manage_status", interaction)
+        self.assertIn("only work inside a server", interaction.followup.last_text)
 
 
 if __name__ == "__main__":

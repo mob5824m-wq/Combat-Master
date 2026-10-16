@@ -1,0 +1,768 @@
+"""Staff operations: the one place where things happen.
+
+Slash commands, the dashboard and the scheduler all call these functions. Each
+one checks its inputs, talks to Discord through a :class:`Gateway`, writes the
+database row, records an audit entry and (where it applies) posts to the staff
+log. Failures a staff member should see are raised as :class:`OperationError`
+with a message written for them.
+
+Nothing here imports discord.py's client. The live bot passes a
+``DiscordGateway``; the dashboard demo and the tests pass a fake one. That is
+why the behaviour can be tested without a Discord connection.
+"""
+
+from __future__ import annotations
+
+import functools
+import logging
+from datetime import datetime, timedelta, timezone
+from typing import Any, Optional, Protocol
+
+import discord
+
+import announcements as ann
+import audit
+import events
+import polls
+import settings
+import welcome
+from audit import Actor, SCHEDULER_ACTOR
+
+logger = logging.getLogger("combat_master.operations")
+
+POLL_MIN_DURATION = timedelta(minutes=1)
+POLL_MAX_DURATION = timedelta(days=30)
+
+
+class OperationError(Exception):
+    """A problem to show the staff member, worded for them."""
+
+
+class Gateway(Protocol):
+    """What the operations need from Discord. Methods raise OperationError on failure."""
+
+    def guilds(self) -> list[dict[str, Any]]:
+        """``[{"id", "name", "member_count"}]`` for every server the bot is in."""
+
+    def snapshot(self, guild_id: int) -> Optional[dict[str, Any]]:
+        """Channels and roles for dropdowns, or ``None`` if the bot is not there."""
+
+    def channel_problem(self, guild_id: int, channel_id: int) -> Optional[str]:
+        """Why the bot can not post in the channel, or ``None``."""
+
+    def ping_warning(self, guild_id: int, role_id: int) -> Optional[str]:
+        """A note if the role is set so that it would not notify anyone, or ``None``."""
+
+    async def post(
+        self,
+        guild_id: int,
+        channel_id: int,
+        *,
+        embed: Optional[discord.Embed] = None,
+        content: Optional[str] = None,
+        role_id: Optional[int] = None,
+        user_ids: tuple[int, ...] = (),
+        publish: bool = False,
+    ) -> dict[str, Any]:
+        """Send a message. Returns ``{"message_id", "jump_url", "published"}``."""
+
+    async def edit_embed(self, guild_id: int, channel_id: int, message_id: int, embed: discord.Embed) -> None:
+        ...
+
+    async def reaction_counts(
+        self, guild_id: int, channel_id: int, message_id: int, emojis: list[str]
+    ) -> list[int]:
+        """Raw reaction counts, one per emoji, including the bot's own."""
+
+    async def reactors(
+        self, guild_id: int, channel_id: int, message_id: int, emoji: str, limit: int
+    ) -> list[int]:
+        """User ids who added the emoji, bots excluded."""
+
+    async def add_reactions(self, guild_id: int, channel_id: int, message_id: int, emojis: list[str]) -> None:
+        ...
+
+
+# --------------------------------------------------------------------------- #
+# Helpers
+# --------------------------------------------------------------------------- #
+def _user_errors(fn):
+    """Turn a ValueError from input parsing into an OperationError."""
+
+    @functools.wraps(fn)
+    async def wrapper(*args, **kwargs):
+        try:
+            return await fn(*args, **kwargs)
+        except ValueError as exc:
+            raise OperationError(str(exc)) from None
+
+    return wrapper
+
+
+def _now(now: Optional[datetime]) -> datetime:
+    return now or datetime.now(timezone.utc)
+
+
+def _actor_mention(actor: Actor) -> str:
+    return f"<@{actor.id}>" if actor.source == "discord" else actor.name
+
+
+def _require_channel(gw: Gateway, cfg: dict, guild_id: int, channel_id: Optional[int]) -> int:
+    target = int(channel_id) if channel_id else settings.get_announcement_channel_id(cfg, guild_id)
+    if not target:
+        raise OperationError(
+            "No channel was given and no announcement channel is set. Choose a channel, "
+            "or set one with `/manage setup announcement_channel:#channel`."
+        )
+    problem = gw.channel_problem(guild_id, int(target))
+    if problem:
+        raise OperationError(problem)
+    return int(target)
+
+
+def _warnings(gw: Gateway, guild_id: int, role_id: Optional[int], published: Optional[bool] = None) -> list[str]:
+    notes = []
+    if role_id:
+        warning = gw.ping_warning(guild_id, int(role_id))
+        if warning:
+            notes.append(warning)
+    if published is False:
+        notes.append("Could not publish it to followers. Check that the channel is an announcement channel.")
+    return notes
+
+
+async def _log(gw: Gateway, cfg: dict, guild_id: int, embed: discord.Embed) -> None:
+    """Write to the staff log. Never raises: a broken log must not break the action."""
+    channel_id = settings.get_staff_channel_id(cfg, guild_id)
+    if not channel_id:
+        return
+    try:
+        await gw.post(guild_id, channel_id, embed=embed)
+    except Exception as exc:
+        logger.warning("Could not write to the staff log in %s: %s", guild_id, exc)
+
+
+def _failure_embed(title: str, reason: str, channel_id: int, reference: str) -> discord.Embed:
+    embed = discord.Embed(
+        title=title,
+        description=reason[:500],
+        color=discord.Color.red(),
+        timestamp=datetime.now(timezone.utc),
+    )
+    embed.add_field(name="Channel", value=f"<#{channel_id}>", inline=True)
+    embed.add_field(name="Source", value=reference, inline=True)
+    return embed
+
+
+def _persist(cfg: dict) -> None:
+    try:
+        settings.save_config(cfg)
+    except OSError as exc:
+        raise OperationError(f"Could not save the settings: {exc}") from None
+
+
+# --------------------------------------------------------------------------- #
+# Announcements
+# --------------------------------------------------------------------------- #
+@_user_errors
+async def announce_now(
+    gw: Gateway,
+    cfg: dict,
+    guild_id: int,
+    actor: Actor,
+    *,
+    message: str,
+    title: Optional[str] = None,
+    channel_id: Optional[int] = None,
+    mention_role_id: Optional[int] = None,
+    publish: bool = False,
+    now: Optional[datetime] = None,
+) -> dict[str, Any]:
+    body = ann.clean_body(message)
+    heading = ann.clean_title(title)
+    target = _require_channel(gw, cfg, guild_id, channel_id)
+    embed = ann.build_announcement_embed(title=heading, body=body, author_name=actor.name)
+    sent = await gw.post(
+        guild_id,
+        target,
+        embed=embed,
+        content=ann.mention_content(mention_role_id),
+        role_id=mention_role_id,
+        publish=publish,
+    )
+    ann.record_announcement(
+        guild_id=guild_id,
+        channel_id=target,
+        message_id=sent["message_id"],
+        author_id=actor.id,
+        author_name=actor.name,
+        title=heading,
+        body=body,
+        mention_role_id=mention_role_id,
+        source="now",
+        when=_now(now),
+    )
+    audit.record(guild_id, actor, "announce.post", f"#{target}: {heading}")
+    await _log(
+        gw,
+        cfg,
+        guild_id,
+        ann.build_staff_log_embed(
+            heading="Announcement posted",
+            channel_mention=f"<#{target}>",
+            author_mention=_actor_mention(actor),
+            title=heading,
+            body=body,
+            mention=ann.mention_content(mention_role_id),
+            source="Now",
+        ),
+    )
+    return {
+        "message_id": str(sent["message_id"]),
+        "jump_url": sent.get("jump_url"),
+        "channel_id": target,
+        "published": bool(sent.get("published")),
+        "warnings": _warnings(gw, guild_id, mention_role_id, sent.get("published") if publish else None),
+    }
+
+
+@_user_errors
+async def schedule_announcement(
+    gw: Gateway,
+    cfg: dict,
+    guild_id: int,
+    actor: Actor,
+    *,
+    when: str,
+    message: str,
+    title: Optional[str] = None,
+    channel_id: Optional[int] = None,
+    mention_role_id: Optional[int] = None,
+    publish: bool = False,
+    repeat_every: Optional[str] = None,
+    now: Optional[datetime] = None,
+) -> dict[str, Any]:
+    """Schedule one announcement, or a repeating one when ``repeat_every`` is set."""
+    now = _now(now)
+    body = ann.clean_body(message)
+    heading = ann.clean_title(title)
+    send_at = ann.parse_send_time(when, now, settings.get_timezone_name(cfg, guild_id))
+    interval = ann.parse_interval(repeat_every) if repeat_every else None
+    target = _require_channel(gw, cfg, guild_id, channel_id)
+    schedule_id = ann.add_scheduled(
+        guild_id=guild_id,
+        channel_id=target,
+        author_id=actor.id,
+        author_name=actor.name,
+        title=heading,
+        body=body,
+        mention_role_id=mention_role_id,
+        send_at=send_at,
+        publish=publish,
+        interval_seconds=interval,
+        now=now,
+    )
+    kind = "repeat.create" if interval else "schedule.create"
+    audit.record(guild_id, actor, kind, f"#{schedule_id} for {ann.iso_utc(send_at)} in #{target}")
+    return {
+        "id": schedule_id,
+        "send_at": ann.iso_utc(send_at),
+        "repeat_seconds": interval,
+        "channel_id": target,
+        "warnings": _warnings(gw, guild_id, mention_role_id),
+    }
+
+
+def cancel_schedule(guild_id: int, actor: Actor, schedule_id: int) -> None:
+    if not ann.cancel_scheduled(guild_id, schedule_id):
+        raise OperationError(
+            f"There is no pending scheduled announcement #{schedule_id} in this server. "
+            "Check the scheduled list."
+        )
+    audit.record(guild_id, actor, "schedule.cancel", f"#{schedule_id}")
+
+
+def list_schedule(guild_id: int) -> list[dict[str, Any]]:
+    return ann.list_pending(guild_id)
+
+
+def list_history(guild_id: int, limit: int = ann.DEFAULT_HISTORY_LIMIT) -> list[dict[str, Any]]:
+    return ann.list_history(guild_id, limit)
+
+
+@_user_errors
+async def save_template(
+    guild_id: int, actor: Actor, *, name: str, title: Optional[str], message: str
+) -> dict[str, Any]:
+    clean_name = ann.clean_template_name(name)
+    body = ann.clean_body(message)
+    heading = ann.clean_title(title)
+    updated = ann.save_template(guild_id, clean_name, heading, body, actor.id)
+    audit.record(guild_id, actor, "template.save", clean_name)
+    return {"name": clean_name, "updated": updated}
+
+
+def delete_template(guild_id: int, actor: Actor, name: str) -> None:
+    if not ann.delete_template(guild_id, name):
+        raise OperationError(f"There is no template called `{name}`.")
+    audit.record(guild_id, actor, "template.delete", name)
+
+
+def list_templates(guild_id: int) -> list[dict[str, Any]]:
+    return ann.list_templates(guild_id)
+
+
+@_user_errors
+async def use_template(
+    gw: Gateway,
+    cfg: dict,
+    guild_id: int,
+    actor: Actor,
+    *,
+    name: str,
+    channel_id: Optional[int] = None,
+    mention_role_id: Optional[int] = None,
+    publish: bool = False,
+) -> dict[str, Any]:
+    template = ann.get_template(guild_id, name)
+    if template is None:
+        raise OperationError(f"There is no template called `{name}`.")
+    return await announce_now(
+        gw,
+        cfg,
+        guild_id,
+        actor,
+        message=template["body"],
+        title=template["title"],
+        channel_id=channel_id,
+        mention_role_id=mention_role_id,
+        publish=publish,
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Polls
+# --------------------------------------------------------------------------- #
+@_user_errors
+async def create_poll(
+    gw: Gateway,
+    cfg: dict,
+    guild_id: int,
+    actor: Actor,
+    *,
+    question: str,
+    options: Any,
+    channel_id: Optional[int] = None,
+    duration: Optional[str] = None,
+    now: Optional[datetime] = None,
+) -> dict[str, Any]:
+    now = _now(now)
+    text = polls.clean_question(question)
+    choices = polls.parse_options(options)
+    ends_at = None
+    if duration:
+        seconds = ann.parse_duration(duration)
+        if seconds is None:
+            raise ValueError("I could not read that duration. Use something like `1h` or `2d`.")
+        ends_at = now + timedelta(seconds=seconds)
+        if ends_at - now < POLL_MIN_DURATION or ends_at - now > POLL_MAX_DURATION:
+            raise ValueError("A poll must run between 1 minute and 30 days.")
+    target = _require_channel(gw, cfg, guild_id, channel_id)
+    embed = polls.build_poll_embed(question=text, options=choices, ends_at=ends_at, author_name=actor.name)
+    sent = await gw.post(guild_id, target, embed=embed)
+    poll_id = polls.create_poll(
+        guild_id=guild_id,
+        channel_id=target,
+        author_id=actor.id,
+        question=text,
+        options=choices,
+        ends_at=ends_at,
+        now=now,
+    )
+    polls.attach_message(poll_id, sent["message_id"])
+    try:
+        await gw.add_reactions(guild_id, target, sent["message_id"], polls.EMOJIS[: len(choices)])
+    except OperationError as exc:
+        logger.warning("Poll #%s posted without its voting reactions: %s", poll_id, exc)
+    audit.record(guild_id, actor, "poll.create", f"#{poll_id}: {text}")
+    return {
+        "id": poll_id,
+        "channel_id": target,
+        "message_id": str(sent["message_id"]),
+        "ends_at": ann.iso_utc(ends_at) if ends_at else None,
+        "options": choices,
+    }
+
+
+async def _finish_poll(gw: Gateway, cfg: dict, poll: dict[str, Any], actor: Actor, now: datetime) -> dict[str, Any]:
+    guild_id, channel_id = poll["guild_id"], poll["channel_id"]
+    emojis = polls.EMOJIS[: len(poll["options"])]
+    try:
+        raw = await gw.reaction_counts(guild_id, channel_id, poll["message_id"], emojis)
+    except OperationError as exc:
+        # The poll message was deleted. Close the poll with no votes rather than retry forever.
+        logger.warning("Could not read poll #%s votes (%s); closing it with zero votes.", poll["id"], exc)
+        raw = [1] * len(emojis)
+    votes = polls.votes_from_reactions(raw)
+    embed = polls.build_poll_embed(
+        question=poll["question"], options=poll["options"], votes=votes, author_name=""
+    )
+    try:
+        await gw.edit_embed(guild_id, channel_id, poll["message_id"], embed)
+    except OperationError as exc:
+        logger.warning("Could not update poll #%s message: %s", poll["id"], exc)
+    polls.mark_closed(poll["id"], votes, now)
+    audit.record(guild_id, actor, "poll.close", f"#{poll['id']}: {poll['question']}")
+    return {"id": poll["id"], "question": poll["question"], "options": poll["options"], "votes": votes}
+
+
+@_user_errors
+async def close_poll(gw: Gateway, cfg: dict, guild_id: int, actor: Actor, poll_id: int, *, now: Optional[datetime] = None) -> dict[str, Any]:
+    poll = polls.get_poll(guild_id, poll_id)
+    if poll is None:
+        raise OperationError(f"There is no poll #{poll_id} in this server.")
+    if poll["status"] != "open":
+        raise OperationError(f"Poll #{poll_id} is already closed.")
+    return await _finish_poll(gw, cfg, poll, actor, _now(now))
+
+
+def list_polls(guild_id: int, *, open_only: bool = False) -> list[dict[str, Any]]:
+    return polls.list_polls(guild_id, open_only=open_only)
+
+
+# --------------------------------------------------------------------------- #
+# Events
+# --------------------------------------------------------------------------- #
+@_user_errors
+async def create_event(
+    gw: Gateway,
+    cfg: dict,
+    guild_id: int,
+    actor: Actor,
+    *,
+    title: str,
+    starts_when: str,
+    description: str = "",
+    channel_id: Optional[int] = None,
+    remind_minutes: Optional[int] = None,
+    now: Optional[datetime] = None,
+) -> dict[str, Any]:
+    now = _now(now)
+    heading = events.clean_title(title)
+    details = events.clean_description(description)
+    starts_at = ann.parse_send_time(starts_when, now, settings.get_timezone_name(cfg, guild_id))
+    events.check_start_time(starts_at, now)
+    remind = events.clean_remind_minutes(remind_minutes)
+    target = _require_channel(gw, cfg, guild_id, channel_id)
+    embed = events.build_event_embed(
+        title=heading, description=details, starts_at=starts_at, author_name=actor.name, going=0
+    )
+    sent = await gw.post(guild_id, target, embed=embed)
+    event_id = events.create_event(
+        guild_id=guild_id,
+        channel_id=target,
+        author_id=actor.id,
+        title=heading,
+        description=details,
+        starts_at=starts_at,
+        remind_minutes=remind,
+        now=now,
+    )
+    events.attach_message(event_id, sent["message_id"])
+    try:
+        await gw.add_reactions(guild_id, target, sent["message_id"], [events.RSVP_EMOJI])
+    except OperationError as exc:
+        logger.warning("Event #%s posted without its RSVP reaction: %s", event_id, exc)
+    audit.record(guild_id, actor, "event.create", f"#{event_id}: {heading}")
+    return {
+        "id": event_id,
+        "channel_id": target,
+        "message_id": str(sent["message_id"]),
+        "starts_at": ann.iso_utc(starts_at),
+        "reminder_at": ann.iso_utc(events.reminder_time(starts_at, remind)) if remind else None,
+    }
+
+
+@_user_errors
+async def cancel_event(gw: Gateway, cfg: dict, guild_id: int, actor: Actor, event_id: int) -> None:
+    event = events.get_event(guild_id, event_id)
+    if event is None or event["status"] != "open":
+        raise OperationError(f"There is no open event #{event_id} in this server.")
+    events.cancel_event(guild_id, event_id)
+    embed = events.build_event_embed(
+        title=event["title"],
+        description=event["description"],
+        starts_at=ann.parse_stored(event["starts_at"]),
+        author_name=actor.name,
+        cancelled=True,
+    )
+    if event["message_id"]:
+        try:
+            await gw.edit_embed(guild_id, event["channel_id"], event["message_id"], embed)
+        except OperationError as exc:
+            logger.warning("Could not mark event #%s cancelled on Discord: %s", event_id, exc)
+    audit.record(guild_id, actor, "event.cancel", f"#{event_id}: {event['title']}")
+
+
+async def list_events(gw: Gateway, guild_id: int, *, now: Optional[datetime] = None) -> list[dict[str, Any]]:
+    """Upcoming events, each with its live RSVP count (``None`` if unreadable)."""
+    rows = events.list_upcoming(guild_id, _now(now))
+    for row in rows:
+        row["going"] = None
+        if row["message_id"]:
+            try:
+                raw = await gw.reaction_counts(guild_id, row["channel_id"], row["message_id"], [events.RSVP_EMOJI])
+                row["going"] = polls.votes_from_reactions(raw)[0]
+            except OperationError:
+                pass
+    return rows
+
+
+# --------------------------------------------------------------------------- #
+# Welcome messages
+# --------------------------------------------------------------------------- #
+@_user_errors
+async def set_welcome(
+    gw: Gateway,
+    cfg: dict,
+    guild_id: int,
+    actor: Actor,
+    *,
+    channel_id: int,
+    message: Optional[str] = None,
+) -> dict[str, Any]:
+    problem = gw.channel_problem(guild_id, int(channel_id))
+    if problem:
+        raise OperationError(problem)
+    settings.set_guild_value(cfg, guild_id, "welcome_channel_id", int(channel_id))
+    if message is not None:
+        settings.set_guild_value(cfg, guild_id, "welcome_message", welcome.clean_template(message))
+    _persist(cfg)
+    audit.record(guild_id, actor, "welcome.set", f"#{channel_id}")
+    return {"channel_id": int(channel_id), "message": welcome_template(cfg, guild_id)}
+
+
+def disable_welcome(cfg: dict, guild_id: int, actor: Actor) -> None:
+    settings.set_guild_value(cfg, guild_id, "welcome_channel_id", None)
+    _persist(cfg)
+    audit.record(guild_id, actor, "welcome.off", "")
+
+
+def welcome_template(cfg: dict, guild_id: int) -> str:
+    return settings.get_guild_config(cfg, guild_id)["welcome_message"] or welcome.DEFAULT_WELCOME_MESSAGE
+
+
+def render_for(cfg: dict, guild_id: int, *, mention: str, name: str, server: str, members: int) -> str:
+    return welcome.render_welcome(
+        welcome_template(cfg, guild_id), mention=mention, name=name, server=server, members=members
+    )
+
+
+@_user_errors
+async def send_test_welcome(gw: Gateway, cfg: dict, guild_id: int, actor: Actor, *, server: str, members: int) -> dict[str, Any]:
+    channel_id = settings.get_welcome_channel_id(cfg, guild_id)
+    if not channel_id:
+        raise OperationError("Welcome messages are off. Set a channel with `/manage welcome set`.")
+    problem = gw.channel_problem(guild_id, channel_id)
+    if problem:
+        raise OperationError(problem)
+    text = render_for(
+        cfg, guild_id, mention=f"<@{actor.id}>", name=actor.name, server=server, members=members
+    )
+    sent = await gw.post(guild_id, channel_id, content=text, user_ids=(actor.id,))
+    audit.record(guild_id, actor, "welcome.test", f"#{channel_id}")
+    return {"message_id": str(sent["message_id"]), "channel_id": channel_id, "text": text}
+
+
+async def send_welcome(
+    gw: Gateway,
+    cfg: dict,
+    guild_id: int,
+    *,
+    user_id: int,
+    user_name: str,
+    server: str,
+    members: int,
+) -> Optional[dict[str, Any]]:
+    """Welcome a new member. Returns ``None`` when welcomes are off. Never raises."""
+    channel_id = settings.get_welcome_channel_id(cfg, guild_id)
+    if not channel_id:
+        return None
+    text = render_for(
+        cfg, guild_id, mention=f"<@{user_id}>", name=user_name, server=server, members=members
+    )
+    try:
+        return await gw.post(guild_id, channel_id, content=text, user_ids=(user_id,))
+    except OperationError as exc:
+        logger.warning("Could not send the welcome in %s: %s", guild_id, exc)
+        return None
+
+
+# --------------------------------------------------------------------------- #
+# Settings
+# --------------------------------------------------------------------------- #
+SETTING_FIELDS = (
+    "staff_role_id",
+    "announcement_channel_id",
+    "staff_channel_id",
+    "timezone",
+    "welcome_channel_id",
+    "welcome_message",
+)
+
+
+@_user_errors
+async def update_settings(gw: Gateway, cfg: dict, guild_id: int, actor: Actor, changes: dict[str, Any]) -> dict[str, Any]:
+    """Apply the given settings for one server. ``None`` clears a value."""
+    applied = {}
+    for key, value in changes.items():
+        if key not in SETTING_FIELDS:
+            raise ValueError(f"Unknown setting `{key}`.")
+        if value in ("", 0):
+            value = None
+        if key == "timezone" and value:
+            value = ann.validate_timezone(str(value))
+        if key == "welcome_message" and value:
+            value = welcome.clean_template(str(value))
+        if key.endswith("_id") and value is not None:
+            value = int(value)
+            if key in ("announcement_channel_id", "staff_channel_id", "welcome_channel_id"):
+                problem = gw.channel_problem(guild_id, value)
+                if problem:
+                    raise OperationError(problem)
+        settings.set_guild_value(cfg, guild_id, key, value)
+        applied[key] = value
+    _persist(cfg)
+    audit.record(guild_id, actor, "settings.update", ", ".join(sorted(applied)))
+    return applied
+
+
+# --------------------------------------------------------------------------- #
+# The scheduler
+# --------------------------------------------------------------------------- #
+async def run_scheduler(gw: Gateway, cfg: dict, *, now: Optional[datetime] = None) -> dict[str, int]:
+    """Do everything that is due: scheduled posts, poll closes, event reminders."""
+    now = _now(now)
+    counts = {"posted": 0, "failed": 0, "polls_closed": 0, "reminders": 0}
+
+    for row in ann.list_due_scheduled(now):
+        await _run_scheduled(gw, cfg, row, now, counts)
+
+    for poll in polls.list_due_polls(now):
+        try:
+            await _finish_poll(gw, cfg, poll, SCHEDULER_ACTOR, now)
+            counts["polls_closed"] += 1
+        except Exception:
+            logger.exception("Could not close poll #%s", poll["id"])
+
+    for event in events.list_due_reminders(now):
+        await _send_reminder(gw, cfg, event, counts)
+
+    return counts
+
+
+async def _run_scheduled(gw: Gateway, cfg: dict, row: dict[str, Any], now: datetime, counts: dict[str, int]) -> None:
+    guild_id = int(row["guild_id"])
+    channel_id = int(row["channel_id"])
+    repeating = row["interval_seconds"] is not None
+    source = "repeat" if repeating else "scheduled"
+    author = row["author_name"] or "staff"
+    error: Optional[str] = None
+    try:
+        problem = gw.channel_problem(guild_id, channel_id)
+        if problem:
+            raise OperationError(problem)
+        embed = ann.build_announcement_embed(title=row["title"], body=row["body"], author_name=author)
+        await gw.post(
+            guild_id,
+            channel_id,
+            embed=embed,
+            content=ann.mention_content(row["mention_role_id"]),
+            role_id=row["mention_role_id"],
+            publish=bool(row["publish"]),
+        )
+        ann.record_announcement(
+            guild_id=guild_id,
+            channel_id=channel_id,
+            message_id=None,
+            author_id=row["author_id"],
+            author_name=author,
+            title=row["title"],
+            body=row["body"],
+            mention_role_id=row["mention_role_id"],
+            source=source,
+            when=now,
+        )
+        counts["posted"] += 1
+        audit.record(guild_id, SCHEDULER_ACTOR, "schedule.post", f"#{row['id']} ({source}) in #{channel_id}")
+        await _log(
+            gw,
+            cfg,
+            guild_id,
+            ann.build_staff_log_embed(
+                heading="Scheduled announcement posted" if not repeating else "Repeating announcement posted",
+                channel_mention=f"<#{channel_id}>",
+                author_mention=author,
+                title=row["title"],
+                body=row["body"],
+                mention=ann.mention_content(row["mention_role_id"]),
+                source=f"Schedule #{row['id']}",
+            ),
+        )
+    except Exception as exc:
+        error = (str(exc) or type(exc).__name__)[: ann.ERROR_TEXT_LIMIT]
+        counts["failed"] += 1
+        logger.warning("Scheduled announcement #%s failed: %s", row["id"], error)
+        await _log(
+            gw,
+            cfg,
+            guild_id,
+            _failure_embed(
+                "Scheduled announcement failed", error, channel_id, f"Schedule #{row['id']}"
+            ),
+        )
+
+    if repeating:
+        ann.advance_repeat(row, now, error)
+    else:
+        ann.finish_one_off(row["id"], "failed" if error else "sent", error, now)
+
+
+async def _send_reminder(gw: Gateway, cfg: dict, event: dict[str, Any], counts: dict[str, int]) -> None:
+    guild_id, channel_id = int(event["guild_id"]), int(event["channel_id"])
+    try:
+        going: list[int] = []
+        if event["message_id"]:
+            going = await gw.reactors(
+                guild_id, channel_id, event["message_id"], events.RSVP_EMOJI, events.MAX_REMINDER_MENTIONS
+            )
+        mentions = " ".join(f"<@{uid}>" for uid in going)
+        starts = int(ann.parse_stored(event["starts_at"]).timestamp())
+        text = f"**{event['title']}** starts <t:{starts}:R>. {len(going)} going."
+        if mentions:
+            text = f"{text}\n{mentions}"
+        await gw.post(guild_id, channel_id, content=text, user_ids=tuple(going))
+        counts["reminders"] += 1
+        audit.record(guild_id, SCHEDULER_ACTOR, "event.remind", f"#{event['id']}")
+    except Exception as exc:
+        counts["failed"] += 1
+        logger.warning("Could not send the reminder for event #%s: %s", event["id"], exc)
+    finally:
+        # Mark it either way, so a broken event does not produce a reminder every tick.
+        events.mark_reminded(event["id"])
+
+
+# --------------------------------------------------------------------------- #
+# Overview for the dashboard and /manage status
+# --------------------------------------------------------------------------- #
+def overview(cfg: dict, guild_id: int, *, now: Optional[datetime] = None) -> dict[str, Any]:
+    pending = ann.list_pending(guild_id)
+    return {
+        "scheduled": sum(1 for r in pending if r["interval_seconds"] is None),
+        "repeats": sum(1 for r in pending if r["interval_seconds"] is not None),
+        "templates": len(ann.list_templates(guild_id)),
+        "polls_open": len(polls.list_polls(guild_id, open_only=True)),
+        "events_upcoming": len(events.list_upcoming(guild_id, _now(now), limit=100)),
+        "welcome_enabled": settings.get_welcome_channel_id(cfg, guild_id) is not None,
+        "recent": ann.list_history(guild_id, 5),
+    }

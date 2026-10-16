@@ -1,0 +1,322 @@
+"""
+Tests for the web dashboard (dashboard.py): sign-in, the session cookie, CSRF,
+the Host-header allowlist, the login throttle, the JSON API and the page's
+security headers. The server runs in-process with aiohttp's test client
+against a DemoGateway.
+
+Run with either:
+    python -m pytest tests/test_dashboard.py
+    python tests/test_dashboard.py
+"""
+
+from __future__ import annotations
+
+import asyncio
+import copy
+import json
+import os
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO_ROOT))
+
+from aiohttp.test_utils import TestClient, TestServer  # noqa: E402
+
+import audit  # noqa: E402
+import paths  # noqa: E402
+import store  # noqa: E402
+from dashboard import (  # noqa: E402
+    LOGIN_MAX_FAILURES,
+    SESSION_COOKIE,
+    DashboardServer,
+    ensure_dashboard_token,
+)
+from demo import DEMO_GUILDS, DemoGateway, demo_config  # noqa: E402
+
+TOKEN = "test-token-with-enough-length-1234"
+GUILD = str(DEMO_GUILDS[0]["id"])
+ANNOUNCE = str(DEMO_GUILDS[0]["channels"][0][0])
+
+
+class DashboardTestCase(unittest.TestCase):
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self._old = os.environ.get("COMBAT_MASTER_DATA")
+        os.environ["COMBAT_MASTER_DATA"] = self._tmp.name
+        store.init_db()
+        self.gw = DemoGateway()
+        self.cfg = demo_config(DEMO_GUILDS)
+        self.cfg["dashboard_token"] = TOKEN
+
+    def tearDown(self) -> None:
+        if self._old is None:
+            os.environ.pop("COMBAT_MASTER_DATA", None)
+        else:
+            os.environ["COMBAT_MASTER_DATA"] = self._old
+        self._tmp.cleanup()
+
+    def make_server(self, **overrides) -> DashboardServer:
+        options = {"token": TOKEN, "host": "127.0.0.1", "port": 8765}
+        options.update(overrides)
+        return DashboardServer(self.gw, self.cfg, **options)
+
+    def run_client(self, server: DashboardServer, scenario):
+        async def main():
+            async with TestClient(TestServer(server.app)) as client:
+                return await scenario(client)
+        return asyncio.run(main())
+
+    def run_with(self, scenario, **overrides):
+        return self.run_client(self.make_server(**overrides), scenario)
+
+
+async def login(client, token=TOKEN):
+    response = await client.post("api/login", json={"token": token})
+    body = await response.json() if response.status == 200 else None
+    cookie = response.cookies.get(SESSION_COOKIE)
+    return response.status, body, (cookie.value if cookie else None)
+
+
+def auth_headers(cookie: str, csrf: str | None = None) -> dict:
+    headers = {"Cookie": f"{SESSION_COOKIE}={cookie}"}
+    if csrf is not None:
+        headers["X-CSRF-Token"] = csrf
+    return headers
+
+
+class PageTests(DashboardTestCase):
+    def test_page_and_static_files_are_served_with_strict_headers(self):
+        async def scenario(client):
+            page = await client.get("/")
+            self.assertEqual(page.status, 200)
+            self.assertIn("Combat Master", await page.text())
+            self.assertIn("script-src 'self'", page.headers["Content-Security-Policy"])
+            self.assertEqual(page.headers["X-Frame-Options"], "DENY")
+            self.assertEqual(page.headers["X-Content-Type-Options"], "nosniff")
+
+            script = await client.get("/static/dashboard.js")
+            self.assertEqual(script.status, 200)
+            self.assertEqual((await client.get("/static/settings.json")).status, 404)
+            self.assertEqual((await client.get("/static/..%2Fconfig.json")).status, 404)
+        self.run_with(scenario)
+
+    def test_unknown_host_header_is_refused(self):
+        async def scenario(client):
+            response = await client.get("/api/session", headers={"Host": "evil.example"})
+            self.assertEqual(response.status, 400)
+            self.assertIn("Unrecognized Host", await response.text())
+        self.run_with(scenario)
+
+    def test_configured_allowed_host_is_accepted(self):
+        async def scenario(client):
+            response = await client.get("/api/session", headers={"Host": "dash.example.com"})
+            self.assertEqual(response.status, 200)
+        self.run_with(scenario, allowed_hosts={"dash.example.com"})
+
+    def test_api_responses_are_not_cached(self):
+        async def scenario(client):
+            response = await client.get("/api/session")
+            self.assertEqual(response.headers["Cache-Control"], "no-store")
+        self.run_with(scenario)
+
+
+class SignInTests(DashboardTestCase):
+    def test_session_starts_logged_out_and_api_needs_login(self):
+        async def scenario(client):
+            session = await (await client.get("/api/session")).json()
+            self.assertFalse(session["authenticated"])
+            self.assertEqual((await client.get("/api/guilds")).status, 401)
+        self.run_with(scenario)
+
+    def test_wrong_token_is_refused(self):
+        async def scenario(client):
+            status, body, cookie = await login(client, token="nope")
+            self.assertEqual(status, 401)
+            self.assertIsNone(cookie)
+        self.run_with(scenario)
+
+    def test_login_sets_an_httponly_strict_cookie(self):
+        async def scenario(client):
+            response = await client.post("api/login", json={"token": TOKEN})
+            morsel = response.cookies[SESSION_COOKIE]
+            self.assertTrue(morsel["httponly"])
+            self.assertEqual(morsel["samesite"], "Strict")
+        self.run_with(scenario)
+
+    def test_login_then_list_servers_with_ids_as_strings(self):
+        async def scenario(client):
+            status, body, cookie = await login(client)
+            self.assertEqual(status, 200)
+            self.assertTrue(body["csrf"])
+            guilds = await (await client.get("/api/guilds", headers=auth_headers(cookie))).json()
+            self.assertEqual({g["name"] for g in guilds}, {g["name"] for g in DEMO_GUILDS})
+            self.assertIsInstance(guilds[0]["id"], str)  # JavaScript cannot hold 64-bit ids
+        self.run_with(scenario)
+
+    def test_logout_ends_the_session(self):
+        async def scenario(client):
+            _, body, cookie = await login(client)
+            await client.post("api/logout", headers=auth_headers(cookie, body["csrf"]))
+            self.assertEqual((await client.get("/api/guilds", headers=auth_headers(cookie))).status, 401)
+        self.run_with(scenario)
+
+    def test_repeated_failures_are_throttled_even_with_the_right_token(self):
+        async def scenario(client):
+            for _ in range(LOGIN_MAX_FAILURES):
+                status, _, _ = await login(client, token="wrong")
+                self.assertEqual(status, 401)
+            status, _, _ = await login(client)
+            self.assertEqual(status, 429)
+        self.run_with(scenario)
+
+
+class WriteProtectionTests(DashboardTestCase):
+    def test_writes_need_the_csrf_header(self):
+        async def scenario(client):
+            _, body, cookie = await login(client)
+            payload = {"message": "Hello from the dashboard", "channel_id": ANNOUNCE}
+            missing = await client.post(f"api/guilds/{GUILD}/announce", json=payload,
+                                        headers=auth_headers(cookie))
+            self.assertEqual(missing.status, 403)
+            self.assertEqual(self.gw.posts, [])
+
+            wrong = await client.post(f"api/guilds/{GUILD}/announce", json=payload,
+                                      headers=auth_headers(cookie, "not-the-token"))
+            self.assertEqual(wrong.status, 403)
+            self.assertEqual(self.gw.posts, [])
+
+            good = await client.post(f"api/guilds/{GUILD}/announce", json=payload,
+                                     headers=auth_headers(cookie, body["csrf"]))
+            self.assertEqual(good.status, 200)
+            self.assertEqual(len(self.gw.posts), 2)  # announcement plus the staff-log copy
+        self.run_with(scenario)
+
+    def test_dashboard_posts_are_audited_as_dashboard(self):
+        async def scenario(client):
+            _, body, cookie = await login(client)
+            await client.post(f"api/guilds/{GUILD}/announce", json={"message": "Hi", "channel_id": ANNOUNCE},
+                              headers=auth_headers(cookie, body["csrf"]))
+            self.assertEqual(audit.list_entries(int(GUILD), 1)[0]["source"], "dashboard")
+        self.run_with(scenario)
+
+
+class ApiTests(DashboardTestCase):
+    def signed_in(self, client):
+        async def go():
+            _, body, cookie = await login(client)
+            return auth_headers(cookie, body["csrf"]), auth_headers(cookie)
+        return go()
+
+    def test_bad_and_unknown_servers(self):
+        async def scenario(client):
+            _, read = await self.signed_in(client)
+            bad = await client.get("api/guilds/abc/overview", headers=read)
+            self.assertEqual(bad.status, 400)
+            self.assertIn("not valid", (await bad.json())["error"])
+            missing = await client.get("api/guilds/1/overview", headers=read)
+            self.assertEqual(missing.status, 404)
+        self.run_with(scenario)
+
+    def test_overview_and_settings_round_trip(self):
+        async def scenario(client):
+            write, read = await self.signed_in(client)
+            overview = await (await client.get(f"api/guilds/{GUILD}/overview", headers=read)).json()
+            self.assertIn("scheduled", overview["stats"])
+            self.assertIsInstance(overview["recent"], list)
+
+            bad = await client.put(f"api/guilds/{GUILD}/settings", json={"bot_token": "x"}, headers=write)
+            self.assertEqual(bad.status, 400)
+            self.assertIn("Unknown setting", (await bad.json())["error"])
+
+            saved = await client.put(f"api/guilds/{GUILD}/settings", json={"timezone": "Europe/London"},
+                                     headers=write)
+            self.assertEqual(saved.status, 200)
+            self.assertEqual((await saved.json())["timezone"], "Europe/London")
+
+            invalid = await client.put(f"api/guilds/{GUILD}/settings", json={"timezone": "Mars/Base"},
+                                       headers=write)
+            self.assertEqual(invalid.status, 400)
+        self.run_with(scenario)
+
+    def test_schedule_then_cancel(self):
+        async def scenario(client):
+            write, read = await self.signed_in(client)
+            created = await client.post(
+                f"api/guilds/{GUILD}/scheduled",
+                json={"when": "2h", "message": "Restart at 9", "title": "Restart", "channel_id": ANNOUNCE},
+                headers=write,
+            )
+            self.assertEqual(created.status, 201)
+            schedule_id = (await created.json())["id"]
+            listed = await (await client.get(f"api/guilds/{GUILD}/scheduled", headers=read)).json()
+            self.assertEqual(len(listed), 1)
+            gone = await client.delete(f"api/guilds/{GUILD}/scheduled/{schedule_id}", headers=write)
+            self.assertEqual(gone.status, 200)
+            self.assertEqual(await (await client.get(f"api/guilds/{GUILD}/scheduled", headers=read)).json(), [])
+        self.run_with(scenario)
+
+    def test_template_poll_event_and_welcome_endpoints(self):
+        async def scenario(client):
+            write, read = await self.signed_in(client)
+            saved = await client.post(f"api/guilds/{GUILD}/templates",
+                                      json={"name": "raid", "message": "Tonight"}, headers=write)
+            self.assertEqual(saved.status, 200)
+            used = await client.post(f"api/guilds/{GUILD}/templates/raid/use",
+                                     json={"channel_id": ANNOUNCE}, headers=write)
+            self.assertEqual(used.status, 200)
+
+            poll = await client.post(f"api/guilds/{GUILD}/polls",
+                                     json={"question": "Which night?", "options": ["Tue", "Fri"]},
+                                     headers=write)
+            self.assertEqual(poll.status, 201)
+            closed = await client.post(f"api/guilds/{GUILD}/polls/{(await poll.json())['id']}/close",
+                                       headers=write)
+            self.assertEqual(closed.status, 200)
+
+            event = await client.post(f"api/guilds/{GUILD}/events",
+                                      json={"title": "Team night", "starts_when": "3h", "remind_minutes": 60},
+                                      headers=write)
+            self.assertEqual(event.status, 201)
+            listed = await (await client.get(f"api/guilds/{GUILD}/events", headers=read)).json()
+            self.assertEqual(listed[0]["title"], "Team night")
+
+            welcome_channel = str(DEMO_GUILDS[0]["channels"][1][0])
+            set_welcome = await client.post(f"api/guilds/{GUILD}/welcome",
+                                            json={"channel_id": welcome_channel, "message": None},
+                                            headers=write)
+            self.assertEqual(set_welcome.status, 200)
+            test = await client.post(f"api/guilds/{GUILD}/welcome/test", headers=write)
+            self.assertEqual(test.status, 200)
+            off = await client.delete(f"api/guilds/{GUILD}/welcome", headers=write)
+            self.assertEqual(off.status, 200)
+        self.run_with(scenario)
+
+    def test_audit_endpoint(self):
+        async def scenario(client):
+            write, read = await self.signed_in(client)
+            await client.post(f"api/guilds/{GUILD}/announce", json={"message": "x", "channel_id": ANNOUNCE},
+                              headers=write)
+            rows = await (await client.get(f"api/guilds/{GUILD}/audit?limit=5", headers=read)).json()
+            self.assertEqual(rows[0]["action"], "announce.post")
+        self.run_with(scenario)
+
+
+class TokenTests(DashboardTestCase):
+    def test_token_is_generated_once_and_then_reused(self):
+        cfg = {}
+        first = ensure_dashboard_token(cfg)
+        self.assertGreaterEqual(len(first), 24)
+        self.assertEqual(ensure_dashboard_token(cfg), first)
+        saved = json.loads(paths.config_path().read_text(encoding="utf-8"))
+        self.assertEqual(saved["dashboard_token"], first)
+
+    def test_server_needs_a_token(self):
+        with self.assertRaises(ValueError):
+            DashboardServer(self.gw, copy.deepcopy(self.cfg), token="")
+
+
+if __name__ == "__main__":
+    unittest.main()

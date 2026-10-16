@@ -1,39 +1,41 @@
-"""Announcement logic: parsing, embeds, posting, history and the scheduler.
+"""Announcement parsing, embeds, history, scheduling and templates.
 
-Nothing in this module depends on a live Discord connection, except where a
-``discord`` object is handed in by the caller, so the parsing and the
-scheduler can be tested with plain values.
+This module owns the rules for announcement text and times, and the database
+rows behind them. It does not talk to Discord: posting happens in
+:mod:`operations` through a gateway, so the same code serves slash commands,
+the dashboard and the demo.
 
 Times
-    A send time is typed as either a delay (``30m``, ``2h``, ``1d12h``; a bare
-    number means minutes) or an absolute local time (``2026-10-20 18:00``)
-    read in the server's timezone. Both are stored as UTC.
+    A send time is typed as a delay (``30m``, ``2h``, ``1d12h``; a bare number
+    means minutes) or an absolute local time (``2026-10-20 18:00``) read in the
+    server's timezone. Both are stored as UTC.
 """
 
 from __future__ import annotations
 
-import logging
 import re
 from datetime import datetime, timedelta, timezone
-from typing import Any, Awaitable, Callable, Optional
+from typing import Any, Optional
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import discord
 
 import store
 
-logger = logging.getLogger("combat_master.announcements")
-
 MAX_TITLE_LENGTH = 256
 MAX_BODY_LENGTH = 4000
 MAX_SCHEDULE_AHEAD = timedelta(days=365)
 MIN_SCHEDULE_AHEAD = timedelta(minutes=1)
+MIN_REPEAT_INTERVAL = timedelta(minutes=15)
+MAX_REPEAT_INTERVAL = timedelta(days=365)
+MAX_TEMPLATE_NAME = 40
 DEFAULT_HISTORY_LIMIT = 10
-MAX_HISTORY_LIMIT = 25
+MAX_HISTORY_LIMIT = 100
 ERROR_TEXT_LIMIT = 500
 
 EMBED_COLOR = discord.Color.blurple()
 STAFF_LOG_COLOR = discord.Color.dark_grey()
+FAILED_COLOR = discord.Color.red()
 
 DEFAULT_TITLE = "Announcement"
 
@@ -49,9 +51,7 @@ _UNITS = {
     "w": 604800, "week": 604800, "weeks": 604800,
 }
 _DURATION_TOKEN = re.compile(r"\s*(\d+)\s*([a-z]*)\s*")
-_ABSOLUTE = re.compile(
-    r"^\s*(\d{4})-(\d{1,2})-(\d{1,2})[ T](\d{1,2}):(\d{2})\s*$"
-)
+_ABSOLUTE = re.compile(r"^\s*(\d{4})-(\d{1,2})-(\d{1,2})[ T](\d{1,2}):(\d{2})\s*$")
 
 
 def parse_duration(text: str) -> Optional[int]:
@@ -77,6 +77,13 @@ def parse_duration(text: str) -> Optional[int]:
     return total or None
 
 
+def resolve_timezone(tz_name: str) -> ZoneInfo:
+    try:
+        return ZoneInfo(tz_name)
+    except (ZoneInfoNotFoundError, ValueError):
+        return ZoneInfo("UTC")
+
+
 def parse_send_time(text: str, now: datetime, tz_name: str) -> datetime:
     """Turn what a moderator typed into a UTC send time.
 
@@ -93,22 +100,30 @@ def parse_send_time(text: str, now: datetime, tz_name: str) -> datetime:
                 "I could not read that time. Use a delay such as `30m`, `2h` or "
                 "`1d12h`, or a date and time such as `2026-10-20 18:00`."
             )
-        try:
-            tz = ZoneInfo(tz_name)
-        except (ZoneInfoNotFoundError, ValueError):
-            tz = ZoneInfo("UTC")
         year, month, day, hour, minute = (int(g) for g in match.groups())
         try:
-            local = datetime(year, month, day, hour, minute, tzinfo=tz)
+            local = datetime(year, month, day, hour, minute, tzinfo=resolve_timezone(tz_name))
         except ValueError as exc:
             raise ValueError(f"That date does not exist ({exc}).") from None
         target = local.astimezone(timezone.utc)
 
     if target - now < MIN_SCHEDULE_AHEAD:
-        raise ValueError("Scheduled announcements must be at least one minute away.")
+        raise ValueError("That time is too soon. It must be at least one minute away.")
     if target - now > MAX_SCHEDULE_AHEAD:
-        raise ValueError("Scheduled announcements can be at most 365 days away.")
+        raise ValueError("Times can be at most 365 days away.")
     return target
+
+
+def parse_interval(text: str) -> int:
+    """How often a repeating announcement goes out, in seconds."""
+    seconds = parse_duration(text)
+    if seconds is None:
+        raise ValueError("I could not read that interval. Use something like `1d`, `12h` or `30m`.")
+    if seconds < MIN_REPEAT_INTERVAL.total_seconds():
+        raise ValueError("A repeat must be at least 15 minutes apart.")
+    if seconds > MAX_REPEAT_INTERVAL.total_seconds():
+        raise ValueError("A repeat can be at most 365 days apart.")
+    return seconds
 
 
 def validate_timezone(name: str) -> str:
@@ -126,6 +141,10 @@ def validate_timezone(name: str) -> str:
 def iso_utc(moment: datetime) -> str:
     """The storage format: second precision, always UTC, sorts as text."""
     return moment.astimezone(timezone.utc).replace(microsecond=0).isoformat()
+
+
+def parse_stored(value: str) -> datetime:
+    return datetime.fromisoformat(value)
 
 
 def discord_time(moment: datetime) -> str:
@@ -152,12 +171,19 @@ def clean_body(body: Optional[str]) -> str:
     return cleaned
 
 
+def clean_template_name(name: Optional[str]) -> str:
+    cleaned = (name or "").strip().lower()
+    if not cleaned or len(cleaned) > MAX_TEMPLATE_NAME:
+        raise ValueError(f"Template names are 1 to {MAX_TEMPLATE_NAME} characters.")
+    if not re.fullmatch(r"[a-z0-9][a-z0-9 _-]*", cleaned):
+        raise ValueError("Template names use letters, numbers, spaces, `-` and `_` only.")
+    return cleaned
+
+
 # --------------------------------------------------------------------------- #
-# Embeds
+# Embeds and mentions
 # --------------------------------------------------------------------------- #
-def build_announcement_embed(
-    *, title: str, body: str, author_name: str
-) -> discord.Embed:
+def build_announcement_embed(*, title: str, body: str, author_name: str) -> discord.Embed:
     embed = discord.Embed(
         title=title,
         description=body,
@@ -177,16 +203,13 @@ def build_staff_log_embed(
     body: str,
     mention: Optional[str],
     source: str,
+    color: discord.Color = STAFF_LOG_COLOR,
 ) -> discord.Embed:
-    embed = discord.Embed(
-        title=heading,
-        color=STAFF_LOG_COLOR,
-        timestamp=datetime.now(timezone.utc),
-    )
+    embed = discord.Embed(title=heading, color=color, timestamp=datetime.now(timezone.utc))
     embed.add_field(name="Channel", value=channel_mention, inline=True)
     embed.add_field(name="By", value=author_mention, inline=True)
     embed.add_field(name="Source", value=source, inline=True)
-    embed.add_field(name="Title", value=title[:1024], inline=False)
+    embed.add_field(name="Title", value=title[:1024] or "-", inline=False)
     if mention:
         embed.add_field(name="Pinged", value=mention, inline=True)
     preview = body if len(body) <= 300 else body[:297] + "..."
@@ -194,43 +217,35 @@ def build_staff_log_embed(
     return embed
 
 
-# --------------------------------------------------------------------------- #
-# Posting
-# --------------------------------------------------------------------------- #
-async def post_announcement(
-    channel: discord.abc.Messageable,
-    *,
-    title: str,
-    body: str,
-    author_name: str,
-    mention_role: Optional[discord.Role] = None,
-) -> discord.Message:
-    """Post the announcement embed, pinging ``mention_role`` only if given.
+def mention_content(role_id: Optional[int]) -> Optional[str]:
+    return f"<@&{int(role_id)}>" if role_id else None
 
-    ``@everyone`` and ``@here`` are never pinged, even if they appear in the
-    text, and users are never pinged. Only the one role the moderator picked
-    can notify anyone.
+
+def allowed_mentions_for(
+    role_id: Optional[int], user_ids: tuple[int, ...] | list[int] = ()
+) -> discord.AllowedMentions:
+    """The only mentions a post may trigger: its chosen role and listed users.
+
+    ``@everyone`` and ``@here`` are never pinged, whatever the text says.
+    Embeds never ping anyway, but ``content`` could.
     """
-    allowed = discord.AllowedMentions(
-        everyone=False,
-        users=False,
-        roles=[mention_role] if mention_role is not None else False,
-    )
-    return await channel.send(
-        content=mention_role.mention if mention_role is not None else None,
-        embed=build_announcement_embed(
-            title=title, body=body, author_name=author_name
-        ),
-        allowed_mentions=allowed,
-    )
+    users = [discord.Object(id=int(uid)) for uid in user_ids]
+    roles = [discord.Object(id=int(role_id))] if role_id else False
+    if not roles and not users:
+        return discord.AllowedMentions.none()
+    return discord.AllowedMentions(everyone=False, users=users or False, roles=roles)
 
 
+# --------------------------------------------------------------------------- #
+# History
+# --------------------------------------------------------------------------- #
 def record_announcement(
     *,
     guild_id: int,
     channel_id: int,
     message_id: Optional[int],
     author_id: int,
+    author_name: str,
     title: str,
     body: str,
     mention_role_id: Optional[int],
@@ -238,14 +253,15 @@ def record_announcement(
     when: Optional[datetime] = None,
 ) -> int:
     return store.db_insert(
-        "INSERT INTO announcements (guild_id, channel_id, message_id, author_id, "
+        "INSERT INTO announcements (guild_id, channel_id, message_id, author_id, author_name, "
         "title, body, mention_role_id, source, created_at) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (
-            guild_id,
-            channel_id,
+            int(guild_id),
+            int(channel_id),
             message_id,
-            author_id,
+            int(author_id),
+            author_name[:100],
             title,
             body,
             mention_role_id,
@@ -258,38 +274,43 @@ def record_announcement(
 def list_history(guild_id: int, limit: int = DEFAULT_HISTORY_LIMIT) -> list[dict[str, Any]]:
     limit = max(1, min(int(limit), MAX_HISTORY_LIMIT))
     return store.db_fetchall(
-        "SELECT * FROM announcements WHERE guild_id = ? "
-        "ORDER BY created_at DESC, id DESC LIMIT ?",
-        (guild_id, limit),
+        "SELECT * FROM announcements WHERE guild_id = ? ORDER BY created_at DESC, id DESC LIMIT ?",
+        (int(guild_id), limit),
     )
 
 
 # --------------------------------------------------------------------------- #
-# Scheduling
+# Scheduling (one-off and repeating share one table)
 # --------------------------------------------------------------------------- #
 def add_scheduled(
     *,
     guild_id: int,
     channel_id: int,
     author_id: int,
+    author_name: str,
     title: str,
     body: str,
     mention_role_id: Optional[int],
     send_at: datetime,
+    publish: bool = False,
+    interval_seconds: Optional[int] = None,
     now: Optional[datetime] = None,
 ) -> int:
     return store.db_insert(
-        "INSERT INTO scheduled_announcements (guild_id, channel_id, author_id, "
-        "title, body, mention_role_id, send_at, status, created_at) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?)",
+        "INSERT INTO scheduled_announcements (guild_id, channel_id, author_id, author_name, title, "
+        "body, mention_role_id, publish, send_at, interval_seconds, runs, status, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 'pending', ?)",
         (
-            guild_id,
-            channel_id,
-            author_id,
+            int(guild_id),
+            int(channel_id),
+            int(author_id),
+            author_name[:100],
             title,
             body,
             mention_role_id,
+            1 if publish else 0,
             iso_utc(send_at),
+            interval_seconds,
             iso_utc(now or datetime.now(timezone.utc)),
         ),
     )
@@ -299,7 +320,14 @@ def list_pending(guild_id: int) -> list[dict[str, Any]]:
     return store.db_fetchall(
         "SELECT * FROM scheduled_announcements WHERE guild_id = ? AND status = 'pending' "
         "ORDER BY send_at, id",
-        (guild_id,),
+        (int(guild_id),),
+    )
+
+
+def get_scheduled(guild_id: int, schedule_id: int) -> Optional[dict[str, Any]]:
+    return store.db_fetchone(
+        "SELECT * FROM scheduled_announcements WHERE id = ? AND guild_id = ?",
+        (int(schedule_id), int(guild_id)),
     )
 
 
@@ -308,41 +336,82 @@ def cancel_scheduled(guild_id: int, schedule_id: int) -> bool:
     changed = store.db_execute(
         "UPDATE scheduled_announcements SET status = 'cancelled' "
         "WHERE id = ? AND guild_id = ? AND status = 'pending'",
-        (schedule_id, guild_id),
+        (int(schedule_id), int(guild_id)),
     )
     return changed > 0
 
 
-def _finish_scheduled(schedule_id: int, status: str, error: Optional[str], now: datetime) -> None:
-    store.db_execute(
-        "UPDATE scheduled_announcements SET status = ?, error = ?, sent_at = ? WHERE id = ?",
-        (status, error, iso_utc(now), schedule_id),
-    )
-
-
-async def run_due_scheduled(
-    now: datetime,
-    deliver: Callable[[dict[str, Any]], Awaitable[Optional[int]]],
-) -> int:
-    """Send every pending announcement whose time has come.
-
-    ``deliver`` posts one row and returns the new message id. A failure marks
-    that row ``failed`` with the reason and the rest still go out. Returns the
-    number of rows attempted.
-    """
-    due = store.db_fetchall(
-        "SELECT * FROM scheduled_announcements "
-        "WHERE status = 'pending' AND send_at <= ? ORDER BY send_at, id",
+def list_due_scheduled(now: datetime) -> list[dict[str, Any]]:
+    return store.db_fetchall(
+        "SELECT * FROM scheduled_announcements WHERE status = 'pending' AND send_at <= ? "
+        "ORDER BY send_at, id",
         (iso_utc(now),),
     )
-    for row in due:
-        try:
-            await deliver(row)
-        except Exception as exc:  # one bad row must not stop the others
-            logger.warning("Scheduled announcement #%s failed: %s", row["id"], exc)
-            _finish_scheduled(
-                row["id"], "failed", str(exc)[:ERROR_TEXT_LIMIT] or type(exc).__name__, now
-            )
-        else:
-            _finish_scheduled(row["id"], "sent", None, now)
-    return len(due)
+
+
+def finish_one_off(schedule_id: int, status: str, error: Optional[str], now: datetime) -> None:
+    store.db_execute(
+        "UPDATE scheduled_announcements SET status = ?, error = ?, sent_at = ?, runs = runs + 1 "
+        "WHERE id = ?",
+        (status, error, iso_utc(now), int(schedule_id)),
+    )
+
+
+def advance_repeat(row: dict[str, Any], now: datetime, error: Optional[str]) -> datetime:
+    """Move a repeating announcement to its next future run.
+
+    Runs missed while the bot was offline are skipped, not posted in a burst.
+    """
+    interval = timedelta(seconds=int(row["interval_seconds"]))
+    next_run = parse_stored(row["send_at"]) + interval
+    while next_run <= now:
+        next_run += interval
+    store.db_execute(
+        "UPDATE scheduled_announcements SET send_at = ?, runs = runs + 1, sent_at = ?, error = ? "
+        "WHERE id = ?",
+        (iso_utc(next_run), iso_utc(now), error, int(row["id"])),
+    )
+    return next_run
+
+
+# --------------------------------------------------------------------------- #
+# Templates
+# --------------------------------------------------------------------------- #
+def save_template(guild_id: int, name: str, title: str, body: str, author_id: int) -> bool:
+    """Create or replace a template. Returns ``True`` if it already existed."""
+    now = iso_utc(datetime.now(timezone.utc))
+    existed = get_template(guild_id, name) is not None
+    if existed:
+        store.db_execute(
+            "UPDATE announcement_templates SET title = ?, body = ?, updated_at = ? "
+            "WHERE guild_id = ? AND name = ?",
+            (title, body, now, int(guild_id), name),
+        )
+    else:
+        store.db_insert(
+            "INSERT INTO announcement_templates (guild_id, name, title, body, created_by, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (int(guild_id), name, title, body, int(author_id), now, now),
+        )
+    return existed
+
+
+def get_template(guild_id: int, name: str) -> Optional[dict[str, Any]]:
+    return store.db_fetchone(
+        "SELECT * FROM announcement_templates WHERE guild_id = ? AND name = ? COLLATE NOCASE",
+        (int(guild_id), name),
+    )
+
+
+def list_templates(guild_id: int) -> list[dict[str, Any]]:
+    return store.db_fetchall(
+        "SELECT * FROM announcement_templates WHERE guild_id = ? ORDER BY name COLLATE NOCASE",
+        (int(guild_id),),
+    )
+
+
+def delete_template(guild_id: int, name: str) -> bool:
+    return store.db_execute(
+        "DELETE FROM announcement_templates WHERE guild_id = ? AND name = ? COLLATE NOCASE",
+        (int(guild_id), name),
+    ) > 0
