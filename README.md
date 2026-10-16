@@ -199,6 +199,30 @@ Discord.
 | `dashboard_allowed_hosts` | `[]` | Extra host names the dashboard answers to, e.g. `["staff.example.com"]`. Loopback names are always allowed. Requests with any other `Host` header get a 400. |
 | `dashboard_trusted_proxies` | `[]` | Addresses of reverse proxies, e.g. `["127.0.0.1"]`. Their `X-Forwarded-For` header is used to tell visitors apart for the login throttle. Without this, every visitor looks like the proxy. |
 
+### Remote access over SSH
+
+Keep the dashboard on `127.0.0.1` and reach it through an SSH tunnel. Nothing
+new is opened on the server, and the port never faces the internet.
+
+1. On the bot's machine, start the bot as usual (`python bot.py`).
+2. On your own computer, open a tunnel. Replace `user` and `server.example.com`
+   with your SSH login and the server's address:
+
+   ```bash
+   ssh -N -L 8765:127.0.0.1:8765 user@server.example.com
+   ```
+
+   `-N` means no remote shell, only the tunnel. Leave the window open while you
+   use the dashboard. Windows 10 and later include this `ssh` command.
+3. Open `http://localhost:8765` in your browser and paste the token.
+
+If port 8765 is already in use on your computer, pick another local port, such
+as `-L 9000:127.0.0.1:8765`, and open `http://localhost:9000`. Use `localhost`
+rather than an IP address, since loopback names are the ones the dashboard
+accepts. You do not need to change `dashboard_allowed_hosts` or
+`dashboard_secure_cookie` for a tunnel. The browser talks plain HTTP to your
+own machine, and SSH carries the traffic to the server.
+
 ### Security
 
 * The session is an **HttpOnly, SameSite=Strict** cookie. Every change also
