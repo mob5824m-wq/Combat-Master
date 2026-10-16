@@ -1,0 +1,27 @@
+name: test
+
+# Runs the unit tests on every push to a working branch and on every pull
+# request into main. The tests never connect to Discord.
+
+on:
+  push:
+    branches: ['arena/**']
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install dependencies
+        run: python -m pip install -r requirements.txt pytest
+      - name: Run tests
+        run: python -m pytest -q
