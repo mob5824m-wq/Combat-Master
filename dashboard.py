@@ -136,6 +136,12 @@ class DashboardServer:
         self._failures: dict[str, deque[float]] = {}
         self._runner: Optional[web.AppRunner] = None
         self._app: Optional[web.Application] = None
+        # Demo mode serves simulated data only, with no secrets. It does not use
+        # the cookie at all: browsers drop SameSite=Strict cookies set inside a
+        # framed preview, which would leave every request looking signed out.
+        self._demo_session: Optional[dict[str, Any]] = (
+            {"csrf": secrets.token_urlsafe(24), "expires": float("inf")} if demo else None
+        )
 
     # ------------------------------------------------------------------ #
     # Application
@@ -223,6 +229,8 @@ class DashboardServer:
     # Sessions, throttling and addresses
     # ------------------------------------------------------------------ #
     def _session(self, request: web.Request) -> Optional[dict[str, Any]]:
+        if self._demo_session is not None:
+            return self._demo_session
         sid = request.cookies.get(SESSION_COOKIE)
         if not sid:
             return None
@@ -322,12 +330,7 @@ class DashboardServer:
 
     async def _session_info(self, request: web.Request) -> web.Response:
         session = self._session(request)
-        new_sid = None
-        if session is None and self.demo:
-            # Demo mode runs over simulated servers and nothing real, so the
-            # visitor is signed in straight away: there is no token to find.
-            new_sid, session = self._open_session()
-        response = self._json(
+        return self._json(
             {
                 "authenticated": session is not None,
                 "csrf": session["csrf"] if session else None,
@@ -335,9 +338,6 @@ class DashboardServer:
                 "version": paths.app_version(),
             }
         )
-        if new_sid is not None:
-            self._attach_session(response, new_sid)
-        return response
 
     async def _login(self, request: web.Request) -> web.Response:
         ip = self._client_ip(request)

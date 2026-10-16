@@ -304,6 +304,33 @@ class ApiTests(DashboardTestCase):
         self.run_with(scenario)
 
 
+class DemoModeTests(DashboardTestCase):
+    """Demo mode must work even when the browser drops cookies (a framed preview)."""
+
+    def test_demo_works_without_any_cookie(self):
+        async def scenario(client):
+            session = await (await client.get("/api/session")).json()
+            self.assertTrue(session["authenticated"])
+            self.assertTrue(session["demo"])
+            guilds = await client.get("/api/guilds")
+            self.assertEqual(guilds.status, 200)
+
+            csrf = session["csrf"]
+            payload = {"message": "Preview post", "channel_id": ANNOUNCE}
+            refused = await client.post(f"api/guilds/{GUILD}/announce", json=payload)
+            self.assertEqual(refused.status, 403)  # CSRF still applies with no cookie
+            posted = await client.post(f"api/guilds/{GUILD}/announce", json=payload,
+                                       headers={"X-CSRF-Token": csrf})
+            self.assertEqual(posted.status, 200)
+        self.run_with(scenario, demo=True, allowed_hosts=["*"])
+
+    def test_live_mode_still_needs_a_token(self):
+        async def scenario(client):
+            self.assertFalse((await (await client.get("/api/session")).json())["authenticated"])
+            self.assertEqual((await client.get("/api/guilds")).status, 401)
+        self.run_with(scenario)
+
+
 class TokenTests(DashboardTestCase):
     def test_token_is_generated_once_and_then_reused(self):
         cfg = {}

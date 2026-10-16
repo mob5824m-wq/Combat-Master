@@ -189,7 +189,8 @@
   function showApp() {
     $("#login-view").hidden = true;
     $("#app-view").hidden = false;
-    $("#logout-btn").hidden = false;
+    // The demo has no sign-in to return to, so it has no log-out either.
+    $("#logout-btn").hidden = state.demo;
   }
 
   async function boot() {
