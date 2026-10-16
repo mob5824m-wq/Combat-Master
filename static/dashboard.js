@@ -132,7 +132,7 @@
   // ------------------------------------------------------------------ //
   // API
   // ------------------------------------------------------------------ //
-  async function api(path, { method = "GET", body } = {}) {
+  async function api(path, { method = "GET", body, retried = false } = {}) {
     const headers = { Accept: "application/json" };
     const init = { method, headers, credentials: "same-origin", cache: "no-store" };
     if (body !== undefined) {
@@ -154,6 +154,15 @@
       data = null;
     }
     if (response.status === 401 && path !== "login") {
+      // Demo mode has no token to type. If its session went stale (the server
+      // restarted or the cookie expired), open a fresh one and retry once.
+      if (state.demo && !retried && path !== "session") {
+        const session = await api("session");
+        if (session.authenticated) {
+          state.csrf = session.csrf;
+          return api(path, { method, body, retried: true });
+        }
+      }
       showLogin();
       throw new Error("Your session has ended. Sign in again.");
     }
