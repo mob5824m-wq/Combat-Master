@@ -45,6 +45,8 @@
         <button type="button" data-tab="approvals">Approvals</button>
         <button type="button" data-tab="templates">Templates</button>
         <button type="button" data-tab="polls">Polls</button>
+        <button type="button" data-tab="tickets">Tickets</button>
+        <button type="button" data-tab="roles">Reaction roles</button>
         <button type="button" data-tab="events">Events</button>
         <button type="button" data-tab="welcome">Welcome</button>
         <button type="button" data-tab="settings">Settings</button>
@@ -189,10 +191,56 @@
           <label>Channel
             <select name="channel_id" class="channel-select"></select>
           </label>
+          <label class="check span2"><input type="checkbox" name="multiple"> Let members pick more than one option</label>
           <div class="actions span2"><button type="submit">Post poll</button></div>
         </form>
         <h3>Recent polls</h3>
         <ul id="poll-list" class="list"></ul>
+        <section id="poll-detail" class="poll-detail" hidden aria-live="polite">
+          <div class="actions">
+            <h3 id="poll-detail-title" class="grow"></h3>
+            <span id="poll-detail-live" class="muted"></span>
+            <button type="button" class="ghost small" id="poll-detail-close">Close</button>
+          </div>
+          <ul id="poll-detail-body" class="list"></ul>
+        </section>
+      </section>
+
+      <!-- Tickets -->
+      <section class="panel" data-panel="tickets" hidden>
+        <h2>Tickets</h2>
+        <form id="ticket-panel-form" class="grid">
+          <label>Post the "Open a ticket" button in
+            <select name="channel_id" class="channel-select"></select>
+          </label>
+          <div class="actions"><button type="submit">Post button</button></div>
+          <p class="span2 muted">Each member can have one open ticket at a time. Opening one creates a private channel for them and the staff role. Closing it deletes the channel; there is no transcript. Set the category new channels go in under Settings.</p>
+        </form>
+        <h3>Open tickets</h3>
+        <ul id="ticket-list" class="list"></ul>
+      </section>
+
+      <!-- Reaction roles -->
+      <section class="panel" data-panel="roles" hidden>
+        <h2>Reaction roles</h2>
+        <form id="role-form" class="grid">
+          <label class="span2">Message link, or its ID
+            <input name="message" required placeholder="Right-click the message, Copy Message Link">
+          </label>
+          <label>Emoji
+            <input name="emoji" required placeholder="🎮">
+          </label>
+          <label>Role to give
+            <select name="role_id" class="role-select" required></select>
+          </label>
+          <label>Channel (only if you gave an ID)
+            <select name="channel_id" class="channel-select"></select>
+          </label>
+          <div class="actions span2"><button type="submit">Add reaction role</button></div>
+          <p class="span2 muted">Members who add the emoji to that message get the role; removing it takes the role away. My role must sit above the role in Server Settings → Roles.</p>
+        </form>
+        <h3>Current rules</h3>
+        <ul id="role-list" class="list"></ul>
       </section>
 
       <!-- Events -->
@@ -264,6 +312,9 @@
             <input name="quiet_end" placeholder="08:00">
           </label>
           <label class="check span2"><input type="checkbox" name="quiet_hold_manual"> Also hold posts made by hand until quiet hours end</label>
+          <label>Ticket category
+            <select name="ticket_category_id" class="category-select"></select>
+          </label>
           <p class="span2 muted">Quiet hours hold scheduled and repeating posts until the window ends. Use 24-hour times in the server's timezone. Leave both empty to turn them off.</p>
           <p class="span2 muted">Staff role: once set, only its holders (and administrators) can use staff tools. Leave it empty to fall back to Manage Server.</p>
           <div class="actions span2"><button type="submit">Save settings</button></div>

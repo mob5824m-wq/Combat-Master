@@ -55,6 +55,7 @@ from discord.ext import commands, tasks
 import announcements as ann
 import audit
 import command_tree
+import components
 import events
 import operations as ops
 import paths
@@ -114,6 +115,8 @@ class CombatMasterBot(commands.Bot):
     # Lifecycle
     # ------------------------------------------------------------------ #
     async def setup_hook(self) -> None:
+        # Vote and ticket buttons on old messages keep working only if these are registered.
+        self.add_dynamic_items(*components.DYNAMIC_ITEMS)
         await _register_cog(self)
         if not self.scheduler_tick.is_running():
             self.scheduler_tick.start()
@@ -163,6 +166,31 @@ class CombatMasterBot(commands.Bot):
             server=guild.name,
             members=guild.member_count or 0,
         )
+
+    async def on_raw_reaction_add(self, payload: discord.RawReactionActionEvent) -> None:
+        if payload.member is not None and payload.member.bot:
+            return
+        await self._reaction_changed(payload, added=True)
+
+    async def on_raw_reaction_remove(self, payload: discord.RawReactionActionEvent) -> None:
+        await self._reaction_changed(payload, added=False)
+
+    async def _reaction_changed(self, payload: discord.RawReactionActionEvent, *, added: bool) -> None:
+        """Give or take a reaction role. Raw events, so messages that are not in the cache still count."""
+        if payload.guild_id is None or (self.user is not None and payload.user_id == self.user.id):
+            return
+        try:
+            await ops.handle_reaction(
+                self.gateway,
+                payload.guild_id,
+                payload.channel_id,
+                payload.message_id,
+                payload.user_id,
+                str(payload.emoji),
+                added=added,
+            )
+        except Exception:  # a reaction must never take the bot down
+            logger.exception("Reaction role handling failed.")
 
     async def close(self) -> None:
         if self.scheduler_tick.is_running():
@@ -261,7 +289,19 @@ template_group = app_commands.Group(
 )
 poll_group = app_commands.Group(
     name="poll",
-    description="Reaction polls that close themselves.",
+    description="Polls with vote buttons that close themselves.",
+    parent=manage_group,
+    guild_only=True,
+)
+ticket_group = app_commands.Group(
+    name="ticket",
+    description="Private support tickets opened from a button.",
+    parent=manage_group,
+    guild_only=True,
+)
+reaction_role_group = app_commands.Group(
+    name="reactionrole",
+    description="Give or take a role when someone reacts to a message.",
     parent=manage_group,
     guild_only=True,
 )
@@ -292,6 +332,8 @@ class CombatMasterCog(commands.Cog):
     manage_group = command_tree.manage_group
     template_group = template_group
     poll_group = poll_group
+    ticket_group = ticket_group
+    reaction_role_group = reaction_role_group
     event_group = event_group
     welcome_group = welcome_group
 
@@ -598,12 +640,13 @@ class CombatMasterCog(commands.Cog):
     # ================================================================== #
     # Polls
     # ================================================================== #
-    @poll_group.command(name="create", description="Post a reaction poll.")
+    @poll_group.command(name="create", description="Post a poll with a button for each option.")
     @app_commands.describe(
         question="The question to ask.",
         options="Choices separated by | (2 to 10), for example: Tuesday | Friday.",
         duration="Optional: how long it stays open, e.g. 2h or 3d. Otherwise close it by hand.",
         channel="Where to post. Defaults to the server's announcement channel.",
+        multiple="Let members pick more than one option. Off means one pick each.",
     )
     async def poll_create(
         self,
@@ -612,6 +655,7 @@ class CombatMasterCog(commands.Cog):
         options: app_commands.Range[str, 1, 1000],
         duration: Optional[app_commands.Range[str, 1, 20]] = None,
         channel: Optional[discord.TextChannel] = None,
+        multiple: bool = False,
     ) -> None:
         if not await self._staff(interaction):
             return
@@ -625,12 +669,14 @@ class CombatMasterCog(commands.Cog):
                 options=options,
                 channel_id=channel.id if channel else None,
                 duration=duration,
+                multiple=multiple,
             )
         except OperationError as exc:
             await self._reply(interaction, str(exc))
             return
         closes = f" It closes {_when_text(result['ends_at'])}." if result["ends_at"] else " Close it with `/manage poll close`."
-        await self._reply(interaction, f"Poll **#{result['id']}** posted in <#{result['channel_id']}>.{closes}")
+        choice = " Members can pick several options." if result["multiple"] else ""
+        await self._reply(interaction, f"Poll **#{result['id']}** posted in <#{result['channel_id']}>.{choice}{closes}")
 
     @poll_group.command(name="list", description="List recent polls.")
     async def poll_list(self, interaction: discord.Interaction) -> None:
@@ -645,6 +691,137 @@ class CombatMasterCog(commands.Cog):
             for row in rows[:25]
         ]
         await self._reply(interaction, "\n".join(lines))
+
+    # ================================================================== #
+    # Tickets
+    # ================================================================== #
+    @ticket_group.command(name="panel", description="Post a button members press to open a ticket.")
+    @app_commands.describe(channel="Where to post the button. Defaults to the announcement channel.")
+    async def ticket_panel(self, interaction: discord.Interaction, channel: Optional[discord.TextChannel] = None) -> None:
+        if not await self._staff(interaction):
+            return
+        try:
+            result = await ops.post_ticket_panel(
+                self.bot.gateway,
+                self.bot.config,
+                interaction.guild_id,
+                _actor(interaction),
+                channel_id=channel.id if channel else None,
+            )
+        except OperationError as exc:
+            await self._reply(interaction, str(exc))
+            return
+        await self._reply(interaction, f"Ticket button posted in <#{result['channel_id']}>: {result['jump_url']}")
+
+    @ticket_group.command(name="list", description="List the tickets that are open now.")
+    async def ticket_list(self, interaction: discord.Interaction) -> None:
+        if not await self._staff(interaction):
+            return
+        rows = ops.list_tickets(interaction.guild_id, open_only=True)
+        if not rows:
+            await self._reply(interaction, "No tickets are open.")
+            return
+        lines = [
+            f"**#{row['id']}** · <#{row['channel_id']}> · {row['opener_name'] or 'a member'} · {_when_text(row['created_at'])}"
+            for row in rows[:25]
+        ]
+        await self._reply(interaction, "\n".join(lines))
+
+    @ticket_group.command(name="close", description="Close a ticket and delete its channel.")
+    @app_commands.describe(ticket_id="The ticket's number. Leave it out when you are inside the ticket.")
+    async def ticket_close(
+        self,
+        interaction: discord.Interaction,
+        ticket_id: Optional[app_commands.Range[int, 1, 2_000_000_000]] = None,
+    ) -> None:
+        if not await self._staff(interaction):
+            return
+        if ticket_id is None:
+            ticket = ops.find_ticket_by_channel(interaction.guild_id, interaction.channel_id)
+            if ticket is None:
+                await self._reply(interaction, "Run this inside a ticket's channel, or give the ticket's number.")
+                return
+            ticket_id = ticket["id"]
+        try:
+            result = await ops.close_ticket(
+                self.bot.gateway,
+                self.bot.config,
+                interaction.guild_id,
+                _actor(interaction),
+                ticket_id,
+                actor_is_staff=True,
+            )
+        except OperationError as exc:
+            await self._reply(interaction, str(exc))
+            return
+        await self._reply(interaction, f"Closed ticket **#{result['id']}** and deleted its channel.")
+
+    # ================================================================== #
+    # Reaction roles
+    # ================================================================== #
+    @reaction_role_group.command(name="add", description="Give a role to members who react with an emoji.")
+    @app_commands.describe(
+        message="A message link (Copy Message Link), or the message's ID.",
+        emoji="The emoji to react with: a standard emoji or a server emoji.",
+        role="The role to give. My role must be above it.",
+        channel="Only needed with a message ID: the channel the message is in.",
+    )
+    async def reactionrole_add(
+        self,
+        interaction: discord.Interaction,
+        message: app_commands.Range[str, 1, 200],
+        emoji: app_commands.Range[str, 1, 64],
+        role: discord.Role,
+        channel: Optional[discord.TextChannel] = None,
+    ) -> None:
+        if not await self._staff(interaction):
+            return
+        try:
+            result = await ops.add_reaction_role(
+                self.bot.gateway,
+                self.bot.config,
+                interaction.guild_id,
+                _actor(interaction),
+                message=message,
+                emoji=emoji,
+                role_id=role.id,
+                channel_id=channel.id if channel else None,
+            )
+        except OperationError as exc:
+            await self._reply(interaction, str(exc))
+            return
+        await self._reply(
+            interaction,
+            f"Reaction role **#{result['id']}** is set. Reacting {result['emoji']} on that message gives @{role.name}.",
+        )
+
+    @reaction_role_group.command(name="list", description="List the reaction roles.")
+    async def reactionrole_list(self, interaction: discord.Interaction) -> None:
+        if not await self._staff(interaction):
+            return
+        rows = ops.list_reaction_roles(interaction.guild_id)
+        if not rows:
+            await self._reply(interaction, "No reaction roles yet.")
+            return
+        lines = [
+            f"**#{row['id']}** · {row['emoji']} · <@&{row['role_id']}> · message {row['message_id']} in <#{row['channel_id']}>"
+            for row in rows[:25]
+        ]
+        await self._reply(interaction, "\n".join(lines))
+
+    @reaction_role_group.command(name="remove", description="Stop an emoji giving a role. Roles already given stay.")
+    @app_commands.describe(rule_id="The number shown by /manage reactionrole list.")
+    async def reactionrole_remove(
+        self, interaction: discord.Interaction, rule_id: app_commands.Range[int, 1, 2_000_000_000]
+    ) -> None:
+        if not await self._staff(interaction):
+            return
+        try:
+            ops.remove_reaction_role(interaction.guild_id, _actor(interaction), rule_id)
+        except OperationError as exc:
+            await self._reply(interaction, str(exc))
+            return
+        await self._reply(interaction, f"Removed reaction role **#{rule_id}**.")
 
     @poll_group.command(name="close", description="Close a poll now and post its results.")
     @app_commands.describe(poll_id="The number shown by /manage poll list.")
@@ -1029,6 +1206,7 @@ class CombatMasterCog(commands.Cog):
         staff_channel="Channel that logs everything that is posted.",
         timezone_name="IANA timezone for typed times, e.g. America/Toronto.",
         require_approval="Hold announcements until another staff member approves them.",
+        ticket_category="Category that ticket channels are created in.",
     )
     @app_commands.rename(timezone_name="timezone")
     async def setup_cmd(
@@ -1039,6 +1217,7 @@ class CombatMasterCog(commands.Cog):
         staff_channel: Optional[discord.TextChannel] = None,
         timezone_name: Optional[app_commands.Range[str, 1, 64]] = None,
         require_approval: Optional[bool] = None,
+        ticket_category: Optional[discord.CategoryChannel] = None,
     ) -> None:
         if not await self._begin(interaction):
             return
@@ -1056,6 +1235,8 @@ class CombatMasterCog(commands.Cog):
             changes["timezone"] = timezone_name
         if require_approval is not None:
             changes["require_approval"] = require_approval
+        if ticket_category:
+            changes["ticket_category_id"] = ticket_category.id
         if not changes:
             await self._reply(interaction, "Nothing changed. Pass at least one option to update it.")
             return

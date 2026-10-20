@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import functools
 import logging
+import sqlite3
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional, Protocol
 
@@ -27,7 +28,9 @@ import events
 import pins
 import polls
 import quiet
+import reaction_roles
 import settings
+import tickets
 import welcome
 from audit import Actor, SCHEDULER_ACTOR
 
@@ -56,6 +59,9 @@ class Gateway(Protocol):
     def ping_warning(self, guild_id: int, role_id: int) -> Optional[str]:
         """A note if the role is set so that it would not notify anyone, or ``None``."""
 
+    def role_problem(self, guild_id: int, role_id: int) -> Optional[str]:
+        """Why the bot can not give this role to members (missing, managed, or above the bot), or ``None``."""
+
     async def post(
         self,
         guild_id: int,
@@ -66,11 +72,42 @@ class Gateway(Protocol):
         role_id: Optional[int] = None,
         user_ids: tuple[int, ...] = (),
         publish: bool = False,
+        view: Optional[list[dict[str, Any]]] = None,
     ) -> dict[str, Any]:
-        """Send a message. Returns ``{"message_id", "jump_url", "published"}``."""
+        """Send a message. Returns ``{"message_id", "jump_url", "published"}``.
 
-    async def edit_embed(self, guild_id: int, channel_id: int, message_id: int, embed: discord.Embed) -> None:
-        ...
+        ``view`` is a list of button specs (``{"custom_id", "label", "emoji", "style"}``)
+        whose buttons keep working after a restart.
+        """
+
+    async def edit_embed(
+        self,
+        guild_id: int,
+        channel_id: int,
+        message_id: int,
+        embed: discord.Embed,
+        *,
+        clear_view: bool = False,
+    ) -> None:
+        """Replace the embed. ``clear_view`` also removes the buttons."""
+
+    async def create_ticket_channel(
+        self,
+        guild_id: int,
+        *,
+        name: str,
+        opener_id: int,
+        category_id: Optional[int],
+        staff_role_id: Optional[int],
+        reason: str,
+    ) -> int:
+        """A private text channel for a ticket. Returns its id."""
+
+    async def delete_channel(self, guild_id: int, channel_id: int, *, reason: str) -> None:
+        """Delete a channel. A channel that is already gone counts as deleted."""
+
+    async def set_member_role(self, guild_id: int, user_id: int, role_id: int, *, add: bool) -> None:
+        """Give or take a role from one member."""
 
     async def reaction_counts(
         self, guild_id: int, channel_id: int, message_id: int, emojis: list[str]
@@ -712,6 +749,7 @@ async def create_poll(
     options: Any,
     channel_id: Optional[int] = None,
     duration: Optional[str] = None,
+    multiple: bool = False,
     now: Optional[datetime] = None,
 ) -> dict[str, Any]:
     now = _now(now)
@@ -726,8 +764,7 @@ async def create_poll(
         if ends_at - now < POLL_MIN_DURATION or ends_at - now > POLL_MAX_DURATION:
             raise ValueError("A poll must run between 1 minute and 30 days.")
     target = _require_channel(gw, cfg, guild_id, channel_id)
-    embed = polls.build_poll_embed(question=text, options=choices, ends_at=ends_at, author_name=actor.name)
-    sent = await gw.post(guild_id, target, embed=embed)
+    # The row is written first: the button ids contain the poll id.
     poll_id = polls.create_poll(
         guild_id=guild_id,
         channel_id=target,
@@ -736,12 +773,25 @@ async def create_poll(
         options=choices,
         ends_at=ends_at,
         now=now,
+        mode=polls.MODE_BUTTONS,
+        multiple=bool(multiple),
     )
-    polls.attach_message(poll_id, sent["message_id"])
+    embed = polls.build_poll_embed(
+        question=text,
+        options=choices,
+        votes=[0] * len(choices),
+        voters=0,
+        ends_at=ends_at,
+        author_name=actor.name,
+        mode=polls.MODE_BUTTONS,
+        multiple=bool(multiple),
+    )
     try:
-        await gw.add_reactions(guild_id, target, sent["message_id"], polls.EMOJIS[: len(choices)])
-    except OperationError as exc:
-        logger.warning("Poll #%s posted without its voting reactions: %s", poll_id, exc)
+        sent = await gw.post(guild_id, target, embed=embed, view=polls.button_specs(poll_id, choices))
+    except Exception:
+        polls.delete_poll(poll_id)
+        raise
+    polls.attach_message(poll_id, sent["message_id"])
     audit.record(guild_id, actor, "poll.create", f"#{poll_id}: {text}")
     return {
         "id": poll_id,
@@ -749,29 +799,111 @@ async def create_poll(
         "message_id": str(sent["message_id"]),
         "ends_at": ann.iso_utc(ends_at) if ends_at else None,
         "options": choices,
+        "multiple": bool(multiple),
+    }
+
+
+@_user_errors
+async def cast_vote(
+    gw: Gateway,
+    cfg: dict,
+    guild_id: int,
+    poll_id: int,
+    actor: Actor,
+    index: int,
+    *,
+    now: Optional[datetime] = None,
+) -> dict[str, Any]:
+    """Record one press of a vote button and refresh the live results on the poll message."""
+    now = _now(now)
+    poll = polls.get_poll_by_id(poll_id)
+    if poll is None or int(poll["guild_id"]) != int(guild_id):
+        raise OperationError("That poll no longer exists.")
+    if poll["mode"] != polls.MODE_BUTTONS:
+        raise OperationError("This is an older poll. Vote by adding its reaction.")
+    closes = ann.parse_stored(poll["ends_at"]) if poll["ends_at"] else None
+    if poll["status"] != "open" or (closes is not None and closes <= now):
+        raise OperationError(f"Poll #{poll['id']} is closed.")
+    options = poll["options"]
+    if not 0 <= int(index) < len(options):
+        raise OperationError("That option no longer exists.")
+    index = int(index)
+    before, after = polls.cast_vote(
+        poll_id=poll["id"],
+        user_id=actor.id,
+        voter_name=actor.name,
+        index=index,
+        multiple=poll["multiple"],
+        now=now,
+    )
+    if before != after:
+        counts, voters = polls.tally(poll["id"], len(options))
+        embed = polls.build_poll_embed(
+            question=poll["question"],
+            options=options,
+            votes=counts,
+            voters=voters,
+            ends_at=closes,
+            mode=polls.MODE_BUTTONS,
+            multiple=poll["multiple"],
+        )
+        try:
+            await gw.edit_embed(guild_id, poll["channel_id"], poll["message_id"], embed)
+        except OperationError as exc:  # the vote is kept even if the message can not be edited
+            logger.warning("Could not refresh poll #%s results: %s", poll["id"], exc)
+    return {
+        "poll_id": poll["id"],
+        "question": poll["question"],
+        "option": options[index],
+        "index": index,
+        "multiple": poll["multiple"],
+        "unchanged": before == after,
+        "added": index in after,
+        "choices": [options[i] for i in after],
     }
 
 
 async def _finish_poll(gw: Gateway, cfg: dict, poll: dict[str, Any], actor: Actor, now: datetime) -> dict[str, Any]:
     guild_id, channel_id = poll["guild_id"], poll["channel_id"]
-    emojis = polls.EMOJIS[: len(poll["options"])]
+    options = poll["options"]
+    voters: Optional[int] = None
+    if poll["mode"] == polls.MODE_BUTTONS:
+        votes, voters = polls.tally(poll["id"], len(options))
+        embed = polls.build_poll_embed(
+            question=poll["question"],
+            options=options,
+            votes=votes,
+            voters=voters,
+            closed=True,
+            mode=polls.MODE_BUTTONS,
+            multiple=poll["multiple"],
+        )
+        clear_view = True
+    else:
+        # A poll from before buttons: the votes are the reactions on its message.
+        emojis = polls.EMOJIS[: len(options)]
+        try:
+            raw = await gw.reaction_counts(guild_id, channel_id, poll["message_id"], emojis)
+        except OperationError as exc:
+            # The poll message was deleted. Close the poll with no votes rather than retry forever.
+            logger.warning("Could not read poll #%s votes (%s); closing it with zero votes.", poll["id"], exc)
+            raw = [1] * len(emojis)
+        votes = polls.votes_from_reactions(raw)
+        embed = polls.build_poll_embed(question=poll["question"], options=options, votes=votes, closed=True)
+        clear_view = False
     try:
-        raw = await gw.reaction_counts(guild_id, channel_id, poll["message_id"], emojis)
-    except OperationError as exc:
-        # The poll message was deleted. Close the poll with no votes rather than retry forever.
-        logger.warning("Could not read poll #%s votes (%s); closing it with zero votes.", poll["id"], exc)
-        raw = [1] * len(emojis)
-    votes = polls.votes_from_reactions(raw)
-    embed = polls.build_poll_embed(
-        question=poll["question"], options=poll["options"], votes=votes, author_name=""
-    )
-    try:
-        await gw.edit_embed(guild_id, channel_id, poll["message_id"], embed)
+        await gw.edit_embed(guild_id, channel_id, poll["message_id"], embed, clear_view=clear_view)
     except OperationError as exc:
         logger.warning("Could not update poll #%s message: %s", poll["id"], exc)
     polls.mark_closed(poll["id"], votes, now)
     audit.record(guild_id, actor, "poll.close", f"#{poll['id']}: {poll['question']}")
-    return {"id": poll["id"], "question": poll["question"], "options": poll["options"], "votes": votes}
+    return {
+        "id": poll["id"],
+        "question": poll["question"],
+        "options": options,
+        "votes": votes,
+        "voters": voters,
+    }
 
 
 @_user_errors
@@ -786,6 +918,215 @@ async def close_poll(gw: Gateway, cfg: dict, guild_id: int, actor: Actor, poll_i
 
 def list_polls(guild_id: int, *, open_only: bool = False) -> list[dict[str, Any]]:
     return polls.list_polls(guild_id, open_only=open_only)
+
+
+def poll_details(guild_id: int, poll_id: int) -> dict[str, Any]:
+    """A poll with its current counts and, for button polls, who voted for what."""
+    poll = polls.get_poll(guild_id, poll_id)
+    if poll is None:
+        raise OperationError(f"There is no poll #{poll_id} in this server.")
+    if poll["mode"] == polls.MODE_BUTTONS:
+        counts, voters_count = polls.tally(poll["id"], len(poll["options"]))
+        people = polls.voters(poll["id"])
+        for person in people:
+            person["choices"] = [poll["options"][i] for i in person["choices"] if 0 <= i < len(poll["options"])]
+    else:
+        counts = poll["results"] or []
+        voters_count = None
+        people = []
+    return {**poll, "counts": counts, "voters_count": voters_count, "voters": people}
+
+
+# --------------------------------------------------------------------------- #
+# Tickets
+# --------------------------------------------------------------------------- #
+@_user_errors
+async def post_ticket_panel(
+    gw: Gateway,
+    cfg: dict,
+    guild_id: int,
+    actor: Actor,
+    *,
+    channel_id: Optional[int] = None,
+) -> dict[str, Any]:
+    target = _require_channel(gw, cfg, guild_id, channel_id)
+    sent = await gw.post(guild_id, target, embed=tickets.panel_embed(), view=tickets.panel_buttons())
+    audit.record(guild_id, actor, "ticket.panel", f"channel {target}")
+    return {"channel_id": target, "message_id": str(sent["message_id"]), "jump_url": sent["jump_url"]}
+
+
+def find_ticket_by_channel(guild_id: int, channel_id: int) -> Optional[dict[str, Any]]:
+    """The open ticket that uses this channel, or ``None``."""
+    row = tickets.get_by_channel(guild_id, channel_id)
+    if row is None or row["status"] != "open":
+        return None
+    return row
+
+
+async def open_ticket(gw: Gateway, cfg: dict, guild_id: int, actor: Actor, *, now: Optional[datetime] = None) -> dict[str, Any]:
+    now = _now(now)
+    existing = tickets.open_for_user(guild_id, actor.id)
+    if existing is not None:
+        raise OperationError(f"You already have ticket #{existing['id']} open: <#{existing['channel_id']}>.")
+    category_id = settings.get_ticket_category_id(cfg, guild_id)
+    staff_role_id = settings.get_staff_role_id(cfg, guild_id)
+    channel_id = await gw.create_ticket_channel(
+        guild_id,
+        name=tickets.channel_name(actor.name),
+        opener_id=actor.id,
+        category_id=category_id,
+        staff_role_id=staff_role_id,
+        reason=f"Ticket opened by {actor.name}",
+    )
+    ticket_id = tickets.create(guild_id, channel_id, actor.id, actor.name, now)
+    mentions = f"<@{actor.id}>" + (f" <@&{staff_role_id}>" if staff_role_id else "")
+    try:
+        await gw.post(
+            guild_id,
+            channel_id,
+            embed=tickets.welcome_embed(actor.name, ticket_id),
+            content=mentions,
+            role_id=staff_role_id,
+            user_ids=(actor.id,),
+            view=tickets.close_buttons(),
+        )
+    except Exception as exc:  # the ticket exists even if its greeting did not post
+        logger.warning("Ticket #%s opened without its greeting: %s", ticket_id, exc)
+    embed = discord.Embed(
+        title=f"Ticket #{ticket_id} opened",
+        description=f"{actor.name} opened <#{channel_id}>.",
+        color=discord.Color.blurple(),
+        timestamp=now,
+    )
+    await _log(gw, cfg, guild_id, embed)
+    audit.record(guild_id, actor, "ticket.open", f"#{ticket_id} in channel {channel_id}")
+    return {"id": ticket_id, "channel_id": str(channel_id)}
+
+
+async def close_ticket(
+    gw: Gateway,
+    cfg: dict,
+    guild_id: int,
+    actor: Actor,
+    ticket_id: int,
+    *,
+    actor_is_staff: bool,
+    now: Optional[datetime] = None,
+) -> dict[str, Any]:
+    """Delete the ticket's channel and record the close. Only staff or the opener may close it."""
+    now = _now(now)
+    ticket = tickets.get(guild_id, ticket_id)
+    if ticket is None:
+        raise OperationError(f"There is no ticket #{ticket_id} in this server.")
+    if ticket["status"] != "open":
+        raise OperationError(f"Ticket #{ticket_id} is already closed.")
+    if not actor_is_staff and int(actor.id) != int(ticket["opener_id"]):
+        raise OperationError("Only the person who opened this ticket, or staff, can close it.")
+    await gw.delete_channel(guild_id, ticket["channel_id"], reason=f"Ticket #{ticket_id} closed by {actor.name}")
+    tickets.mark_closed(ticket_id, actor.name, now)
+    embed = discord.Embed(
+        title=f"Ticket #{ticket_id} closed",
+        description=f"Opened by {ticket['opener_name'] or 'a member'}, closed by {actor.name}.",
+        color=discord.Color.greyple(),
+        timestamp=now,
+    )
+    await _log(gw, cfg, guild_id, embed)
+    audit.record(guild_id, actor, "ticket.close", f"#{ticket_id}")
+    return {"id": ticket_id, "channel_id": str(ticket["channel_id"]), "opener_name": ticket["opener_name"]}
+
+
+def list_tickets(guild_id: int, *, open_only: bool = False) -> list[dict[str, Any]]:
+    return tickets.list_tickets(guild_id, open_only=open_only)
+
+
+# --------------------------------------------------------------------------- #
+# Reaction roles
+# --------------------------------------------------------------------------- #
+@_user_errors
+async def add_reaction_role(
+    gw: Gateway,
+    cfg: dict,
+    guild_id: int,
+    actor: Actor,
+    *,
+    message: str,
+    emoji: str,
+    role_id: Any,
+    channel_id: Optional[int] = None,
+) -> dict[str, Any]:
+    ref_guild, ref_channel, message_id = reaction_roles.parse_message_ref(message)
+    if ref_guild is not None and int(ref_guild) != int(guild_id):
+        raise ValueError("That message link is from another server.")
+    target = ref_channel or (int(channel_id) if channel_id else settings.get_announcement_channel_id(cfg, guild_id))
+    if not target:
+        raise ValueError("Paste a message link, or choose the channel the message is in.")
+    target = int(target)
+    problem = gw.channel_problem(guild_id, target)
+    if problem:
+        raise OperationError(problem)
+    emoji_text = reaction_roles.parse_emoji(emoji)
+    role = int(role_id)
+    problem = gw.role_problem(guild_id, role)
+    if problem:
+        raise OperationError(problem)
+    if reaction_roles.find(message_id, emoji_text):
+        raise ValueError("That emoji already gives a role on that message. Remove it first.")
+    # The bot reacts too, so members have something to click. This also fails if the message is missing.
+    await gw.add_reactions(guild_id, target, message_id, [emoji_text])
+    try:
+        rule_id = reaction_roles.add(
+            guild_id=guild_id, channel_id=target, message_id=message_id, emoji=emoji_text, role_id=role
+        )
+    except sqlite3.IntegrityError:
+        raise ValueError("That emoji already gives a role on that message. Remove it first.") from None
+    audit.record(guild_id, actor, "reactionrole.add", f"#{rule_id}: {emoji_text} gives role {role} on {message_id}")
+    return {
+        "id": rule_id,
+        "channel_id": str(target),
+        "message_id": str(message_id),
+        "emoji": emoji_text,
+        "role_id": str(role),
+    }
+
+
+def list_reaction_roles(guild_id: int) -> list[dict[str, Any]]:
+    return reaction_roles.list_rules(guild_id)
+
+
+def remove_reaction_role(guild_id: int, actor: Actor, rule_id: int) -> None:
+    """Stop the emoji giving a role. Roles members already have are kept."""
+    if reaction_roles.get(guild_id, rule_id) is None:
+        raise OperationError(f"There is no reaction role #{rule_id} in this server.")
+    reaction_roles.remove(guild_id, rule_id)
+    audit.record(guild_id, actor, "reactionrole.remove", f"#{rule_id}")
+
+
+async def handle_reaction(
+    gw: Gateway,
+    guild_id: int,
+    channel_id: int,
+    message_id: int,
+    user_id: int,
+    emoji: str,
+    *,
+    added: bool,
+) -> Optional[int]:
+    """Give or take the role for one reaction. Returns the role id, or ``None`` if nothing applied.
+
+    Never raises: a reaction event is not a command, so a failure is only logged.
+    """
+    rule = reaction_roles.find(message_id, emoji)
+    if rule is None or int(rule["guild_id"]) != int(guild_id):
+        return None
+    try:
+        await gw.set_member_role(guild_id, user_id, int(rule["role_id"]), add=added)
+    except OperationError as exc:
+        logger.warning("Reaction role #%s could not change a role for %s: %s", rule["id"], user_id, exc)
+        return None
+    except Exception:
+        logger.exception("Reaction role #%s failed for %s", rule["id"], user_id)
+        return None
+    return int(rule["role_id"])
 
 
 # --------------------------------------------------------------------------- #
@@ -970,6 +1311,7 @@ SETTING_FIELDS = (
     "quiet_start",
     "quiet_end",
     "quiet_hold_manual",
+    "ticket_category_id",
 )
 
 
@@ -1234,5 +1576,7 @@ def overview(cfg: dict, guild_id: int, *, now: Optional[datetime] = None) -> dic
         "welcome_enabled": settings.get_welcome_channel_id(cfg, guild_id) is not None,
         "approvals_pending": len(approvals.list_pending(guild_id)),
         "pins_active": len(pins.list_active(guild_id)),
+        "tickets_open": len(tickets.list_tickets(guild_id, open_only=True)),
+        "reaction_roles": len(reaction_roles.list_rules(guild_id)),
         "recent": ann.list_history(guild_id, 5),
     }

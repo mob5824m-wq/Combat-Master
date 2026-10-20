@@ -17,6 +17,8 @@
     timezone: "UTC",
     tab: "overview",
     templateName: null,
+    pollDetailId: null,
+    pollTimer: null,
   };
 
   const $ = (selector, root = document) => root.querySelector(selector);
@@ -254,6 +256,8 @@
 
   async function selectGuild(guildId) {
     state.guildId = String(guildId);
+    state.pollDetailId = null;
+    $("#poll-detail").hidden = true;
     $("#guild-select").value = state.guildId;
     try {
       const [snapshot, settings] = await Promise.all([
@@ -310,6 +314,13 @@
       }
       replaceOptions(select, options);
     }
+    for (const select of $$("select.category-select")) {
+      const options = [el("option", { value: "", text: blankLabel(select.closest("form"), "category") })];
+      for (const category of snapshot.categories || []) {
+        options.push(el("option", { value: category.id, text: category.name }));
+      }
+      replaceOptions(select, options);
+    }
   }
 
   // Rebuilding a dropdown must not lose what is chosen in it. Other forms share these
@@ -332,6 +343,7 @@
     form.elements.quiet_start.value = s.quiet_start || "";
     form.elements.quiet_end.value = s.quiet_end || "";
     form.elements.quiet_hold_manual.checked = Boolean(s.quiet_hold_manual);
+    form.elements.ticket_category_id.value = s.ticket_category_id ? String(s.ticket_category_id) : "";
   }
 
   function fillWelcomeForm() {
@@ -364,6 +376,8 @@
     for (const panel of $$("[data-panel]")) {
       panel.hidden = panel.dataset.panel !== name;
     }
+    if (name === "polls") startPollRefresh();
+    else stopPollRefresh();
     refreshTab();
   }
 
@@ -374,6 +388,8 @@
     approvals: loadApprovals,
     templates: loadTemplates,
     polls: loadPolls,
+    tickets: loadTickets,
+    roles: loadRoles,
     events: loadEvents,
     welcome: async () => {},
     settings: async () => {},
@@ -404,6 +420,8 @@
       ["Awaiting approval", s.approvals_pending],
       ["Pinned", s.pins_active],
       ["Welcome", s.welcome_enabled ? "On" : "Off"],
+      ["Open tickets", s.tickets_open],
+      ["Reaction roles", s.reaction_roles],
     ];
     $("#stats").replaceChildren(...cards.map(([label, value]) =>
       el("div", { class: "stat" }, [
@@ -724,6 +742,7 @@
           options,
           duration: opt(f, "duration"),
           channel_id: opt(f, "channel_id"),
+          multiple: f.has("multiple"),
         },
       }),
       (r) => `Poll #${r.id} posted.${r.ends_at ? ` It closes ${fmtTime(r.ends_at)}.` : ""}`,
@@ -762,7 +781,184 @@
       ));
       children.push(button);
     }
+    const resultsButton = el("button", { type: "button", class: "ghost small", text: "Results" });
+    resultsButton.addEventListener("click", () => openPollDetail(row.id));
+    children.push(resultsButton);
     return el("li", {}, children);
+  }
+
+  // ------------------------------------------------------------------ //
+  // Poll results: live while the polls tab is open
+  // ------------------------------------------------------------------ //
+  function openPollDetail(pollId) {
+    state.pollDetailId = String(pollId);
+    $("#poll-detail").hidden = false;
+    loadPollDetail().catch((err) => notice(err.message, "err"));
+  }
+
+  $("#poll-detail-close").addEventListener("click", () => {
+    state.pollDetailId = null;
+    $("#poll-detail").hidden = true;
+  });
+
+  async function loadPollDetail() {
+    if (!state.pollDetailId) return;
+    const poll = await api(`guilds/${state.guildId}/polls/${state.pollDetailId}`);
+    const options = poll.options || [];
+    const counts = poll.counts || [];
+    const total = poll.voters_count === null || poll.voters_count === undefined
+      ? counts.reduce((sum, n) => sum + n, 0)
+      : poll.voters_count;
+    $("#poll-detail-title").textContent = `#${poll.id} · ${poll.question}`;
+    $("#poll-detail-live").textContent = poll.status === "open"
+      ? `Live · ${total} voter(s) · refreshes every few seconds`
+      : `Final · ${total} voter(s)`;
+    const rows = options.map((option, i) => {
+      const count = counts[i] ?? 0;
+      const share = total ? Math.round((100 * count) / total) : 0;
+      const fill = el("div", { class: "poll-bar-fill" });
+      fill.style.width = `${share}%`;
+      return el("li", {}, [
+        el("div", { class: "grow" }, [
+          el("strong", { text: option }),
+          el("div", { class: "meta", text: `${count} vote(s) · ${share}%` }),
+          el("div", { class: "poll-bar" }, [fill]),
+        ]),
+      ]);
+    });
+    if (poll.mode !== "buttons") {
+      rows.push(el("li", { class: "empty", text: "This poll was made before vote buttons. Its votes are reactions, so they are not listed by person." }));
+    } else if ((poll.voters || []).length === 0) {
+      rows.push(el("li", { class: "empty", text: "Nobody has voted yet." }));
+    } else {
+      for (const person of poll.voters) {
+        rows.push(el("li", {}, [
+          el("div", { class: "grow" }, [
+            el("div", { class: "meta", text: `${person.name || "A member"}: ${person.choices.join(", ")}` }),
+          ]),
+        ]));
+      }
+    }
+    $("#poll-detail-body").replaceChildren(...rows);
+  }
+
+  function startPollRefresh() {
+    if (state.pollTimer) return;
+    state.pollTimer = setInterval(async () => {
+      if (state.tab !== "polls" || document.hidden || !state.guildId) return;
+      try {
+        await loadPolls();
+        await loadPollDetail();
+      } catch (_) {
+        // A missed refresh is not worth a message. The next tick tries again.
+      }
+    }, 5000);
+  }
+
+  function stopPollRefresh() {
+    if (state.pollTimer) {
+      clearInterval(state.pollTimer);
+      state.pollTimer = null;
+    }
+  }
+
+  // ------------------------------------------------------------------ //
+  // Tickets
+  // ------------------------------------------------------------------ //
+  $("#ticket-panel-form").addEventListener("submit", (event) => {
+    event.preventDefault();
+    const form = event.currentTarget;
+    const f = new FormData(form);
+    submitForm(
+      form,
+      () => api(`guilds/${state.guildId}/tickets/panel`, {
+        method: "POST",
+        body: { channel_id: opt(f, "channel_id") },
+      }),
+      "Ticket button posted. Members can press it to open a ticket.",
+    );
+  });
+
+  async function loadTickets() {
+    const rows = await api(`guilds/${state.guildId}/tickets?open=1`);
+    renderList($("#ticket-list"), rows, ticketRow, "No open tickets.");
+  }
+
+  function ticketRow(row) {
+    const close = el("button", { type: "button", class: "danger small", text: "Close ticket" });
+    close.addEventListener("click", () => {
+      if (!window.confirm(`Close ticket #${row.id}? Its channel is deleted and can not be recovered.`)) return;
+      runAction(
+        close,
+        () => api(`guilds/${state.guildId}/tickets/${row.id}/close`, { method: "POST" }),
+        (r) => `Closed ticket #${r.id}.`,
+        loadTickets,
+      );
+    });
+    return el("li", {}, [
+      el("div", { class: "grow" }, [
+        el("strong", { text: `Ticket #${row.id}` }),
+        el("div", { class: "meta", text: `${fmtTime(row.created_at)} · opened by ${row.opener_name || "a member"}` }),
+      ]),
+      close,
+    ]);
+  }
+
+  // ------------------------------------------------------------------ //
+  // Reaction roles
+  // ------------------------------------------------------------------ //
+  $("#role-form").addEventListener("submit", (event) => {
+    event.preventDefault();
+    const form = event.currentTarget;
+    const f = new FormData(form);
+    submitForm(
+      form,
+      () => api(`guilds/${state.guildId}/reaction-roles`, {
+        method: "POST",
+        body: {
+          message: opt(f, "message"),
+          emoji: opt(f, "emoji"),
+          role_id: opt(f, "role_id"),
+          channel_id: opt(f, "channel_id"),
+        },
+      }),
+      (r) => `Reaction role #${r.id} is set. Reacting ${r.emoji} on that message gives the role.`,
+      async () => {
+        form.reset();
+        fillSelects();
+        await loadRoles();
+      },
+    );
+  });
+
+  async function loadRoles() {
+    const rows = await api(`guilds/${state.guildId}/reaction-roles`);
+    renderList($("#role-list"), rows, roleRuleRow, "No reaction roles yet.");
+  }
+
+  function roleName(id) {
+    const role = state.snapshot && state.snapshot.roles.find((r) => r.id === String(id));
+    return role ? `@${role.name}` : `role ${id}`;
+  }
+
+  function roleRuleRow(row) {
+    const remove = el("button", { type: "button", class: "danger small", text: "Remove" });
+    remove.addEventListener("click", () => {
+      if (!window.confirm("Remove this reaction role? Roles members already have are kept.")) return;
+      runAction(
+        remove,
+        () => api(`guilds/${state.guildId}/reaction-roles/${row.id}`, { method: "DELETE" }),
+        "Removed the reaction role.",
+        loadRoles,
+      );
+    });
+    return el("li", {}, [
+      el("div", { class: "grow" }, [
+        el("strong", { text: `${row.emoji} gives ${roleName(row.role_id)}` }),
+        el("div", { class: "meta", text: `message ${row.message_id} · ${channelName(row.channel_id)}` }),
+      ]),
+      remove,
+    ]);
   }
 
   // ------------------------------------------------------------------ //
@@ -871,6 +1067,7 @@
           quiet_start: opt(f, "quiet_start"),
           quiet_end: opt(f, "quiet_end"),
           quiet_hold_manual: f.has("quiet_hold_manual"),
+          ticket_category_id: opt(f, "ticket_category_id"),
         },
       }),
       "Settings saved.",

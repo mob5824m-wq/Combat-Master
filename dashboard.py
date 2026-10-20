@@ -183,7 +183,14 @@ class DashboardServer:
         r.add_post(f"{g}/templates/{{name}}/use", self._templates_use)
         r.add_get(f"{g}/polls", self._polls_list)
         r.add_post(f"{g}/polls", self._polls_create)
+        r.add_get(f"{g}/polls/{{pid}}", self._poll_detail)
         r.add_post(f"{g}/polls/{{pid}}/close", self._polls_close)
+        r.add_get(f"{g}/tickets", self._tickets_list)
+        r.add_post(f"{g}/tickets/panel", self._ticket_panel)
+        r.add_post(f"{g}/tickets/{{tid}}/close", self._ticket_close)
+        r.add_get(f"{g}/reaction-roles", self._reaction_roles_list)
+        r.add_post(f"{g}/reaction-roles", self._reaction_role_add)
+        r.add_delete(f"{g}/reaction-roles/{{rid}}", self._reaction_role_remove)
         r.add_get(f"{g}/events", self._events_list)
         r.add_post(f"{g}/events", self._events_create)
         r.add_post(f"{g}/events/{{eid}}/cancel", self._events_cancel)
@@ -428,6 +435,7 @@ class DashboardServer:
             "quiet_start": cfg["quiet_start"],
             "quiet_end": cfg["quiet_end"],
             "quiet_hold_manual": cfg["quiet_hold_manual"],
+            "ticket_category_id": cfg["ticket_category_id"],
             "default_welcome_message": welcome.DEFAULT_WELCOME_MESSAGE,
             "placeholders": list(welcome.PLACEHOLDERS),
         }
@@ -576,8 +584,15 @@ class DashboardServer:
             options=body.get("options") or [],
             channel_id=_as_int(body.get("channel_id"), "channel_id"),
             duration=body.get("duration") or None,
+            multiple=_as_bool(body.get("multiple")),
         )
         return self._json(result, status=201)
+
+    async def _poll_detail(self, request: web.Request) -> web.Response:
+        self._authed(request)
+        guild = await self._guild(request)
+        pid = _as_int(request.match_info["pid"], "id")
+        return self._json(ops.poll_details(guild["id"], pid))
 
     async def _polls_close(self, request: web.Request) -> web.Response:
         self._authed(request)
@@ -585,6 +600,63 @@ class DashboardServer:
         pid = _as_int(request.match_info["pid"], "id")
         result = await ops.close_poll(self.gateway, self.config, guild["id"], DASHBOARD_ACTOR, pid)
         return self._json(result)
+
+    # ------------------------------------------------------------------ #
+    # Tickets and reaction roles
+    # ------------------------------------------------------------------ #
+    async def _tickets_list(self, request: web.Request) -> web.Response:
+        self._authed(request)
+        guild = await self._guild(request)
+        return self._json(ops.list_tickets(guild["id"], open_only=request.query.get("open") == "1"))
+
+    async def _ticket_panel(self, request: web.Request) -> web.Response:
+        self._authed(request)
+        guild = await self._guild(request)
+        body = await self._body(request)
+        result = await ops.post_ticket_panel(
+            self.gateway,
+            self.config,
+            guild["id"],
+            DASHBOARD_ACTOR,
+            channel_id=_as_int(body.get("channel_id"), "channel_id"),
+        )
+        return self._json(result, status=201)
+
+    async def _ticket_close(self, request: web.Request) -> web.Response:
+        self._authed(request)
+        guild = await self._guild(request)
+        tid = _as_int(request.match_info["tid"], "id")
+        result = await ops.close_ticket(
+            self.gateway, self.config, guild["id"], DASHBOARD_ACTOR, tid, actor_is_staff=True
+        )
+        return self._json(result)
+
+    async def _reaction_roles_list(self, request: web.Request) -> web.Response:
+        self._authed(request)
+        guild = await self._guild(request)
+        return self._json(ops.list_reaction_roles(guild["id"]))
+
+    async def _reaction_role_add(self, request: web.Request) -> web.Response:
+        self._authed(request)
+        guild = await self._guild(request)
+        body = await self._body(request)
+        result = await ops.add_reaction_role(
+            self.gateway,
+            self.config,
+            guild["id"],
+            DASHBOARD_ACTOR,
+            message=str(body.get("message") or ""),
+            emoji=str(body.get("emoji") or ""),
+            role_id=_as_int(body.get("role_id"), "role_id"),
+            channel_id=_as_int(body.get("channel_id"), "channel_id"),
+        )
+        return self._json(result, status=201)
+
+    async def _reaction_role_remove(self, request: web.Request) -> web.Response:
+        self._authed(request)
+        guild = await self._guild(request)
+        ops.remove_reaction_role(guild["id"], DASHBOARD_ACTOR, _as_int(request.match_info["rid"], "id"))
+        return self._json({"ok": True})
 
     async def _events_list(self, request: web.Request) -> web.Response:
         self._authed(request)

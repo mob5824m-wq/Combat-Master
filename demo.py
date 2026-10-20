@@ -42,6 +42,7 @@ DEMO_GUILDS = [
             (100000000000000104, "polls", False),
             (100000000000000105, "staff-log", False),
         ],
+        "categories": [(100000000000000901, "Support")],
         "roles": [
             (100000000000000201, "Staff", True),
             (100000000000000202, "Member", True),
@@ -57,6 +58,7 @@ DEMO_GUILDS = [
             (100000000000000302, "chat", False),
             (100000000000000303, "mod-log", False),
         ],
+        "categories": [],
         "roles": [
             (100000000000000401, "Moderators", True),
             (100000000000000402, "Regulars", True),
@@ -85,6 +87,12 @@ class DemoGateway:
         self.pinned: set[tuple[int, int]] = set()
         self.deleted: list[tuple[int, int]] = []
         self.fail_pins = False  # tests set this to simulate missing Manage Messages
+        # Buttons and roles. Tests read these; they do not change what the demo shows.
+        self.deleted_channels: list[int] = []
+        self.created_channels: list[dict[str, Any]] = []
+        self.role_changes: list[tuple[int, int, int, bool]] = []  # (guild, user, role, add)
+        self.unassignable_roles: set[int] = set()  # tests set this to simulate a role above the bot
+        self.fail_ticket_creation = False  # tests set this to simulate missing Manage Channels
 
     # ---- lookups ------------------------------------------------------ #
     def _find(self, guild_id: int) -> Optional[dict[str, Any]]:
@@ -102,6 +110,7 @@ class DemoGateway:
             "name": guild["name"],
             "member_count": guild["member_count"],
             "channels": [{"id": cid, "name": name, "news": news} for cid, name, news in guild["channels"]],
+            "categories": [{"id": cid, "name": name} for cid, name in guild.get("categories", [])],
             "roles": [{"id": rid, "name": name, "mentionable": m} for rid, name, m in guild["roles"]],
         }
 
@@ -124,6 +133,17 @@ class DemoGateway:
                 return f"Note: @{name} is not mentionable, so it will show but not notify."
         return None
 
+    def role_problem(self, guild_id: int, role_id: int) -> Optional[str]:
+        guild = self._find(guild_id)
+        if guild is None:
+            return "I'm not in that server any more."
+        for rid, name, _ in guild["roles"]:
+            if rid == int(role_id):
+                if rid in self.unassignable_roles:
+                    return f"I can not give @{name}: move my role above it in Server Settings → Roles."
+                return None
+        return "That role does not exist in this server any more."
+
     # ---- posting ------------------------------------------------------ #
     def _check(self, guild_id: int, channel_id: int) -> None:
         problem = self.channel_problem(guild_id, channel_id)
@@ -144,6 +164,7 @@ class DemoGateway:
         role_id: Optional[int] = None,
         user_ids: tuple[int, ...] = (),
         publish: bool = False,
+        view: Optional[list[dict[str, Any]]] = None,
     ) -> dict[str, Any]:
         self._check(guild_id, channel_id)
         message_id = self._new_id()
@@ -159,6 +180,7 @@ class DemoGateway:
             "content": content,
             "role_id": role_id,
             "user_ids": list(user_ids),
+            "view": list(view) if view else None,
         }
         self.posts.append({"channel_id": int(channel_id), "message_id": message_id, "content": content, "embed": embed})
         return {
@@ -171,11 +193,64 @@ class DemoGateway:
         guild = self._find(guild_id)
         return guild["channels"] if guild else []
 
-    async def edit_embed(self, guild_id: int, channel_id: int, message_id: int, embed: discord.Embed) -> None:
+    async def edit_embed(
+        self,
+        guild_id: int,
+        channel_id: int,
+        message_id: int,
+        embed: discord.Embed,
+        *,
+        clear_view: bool = False,
+    ) -> None:
         record = self.messages.get((int(channel_id), int(message_id)))
         if record is None:
             raise OperationError("Could not find that message on Discord.")
         record["embed"] = embed
+        if clear_view:
+            record["view"] = None
+
+    async def create_ticket_channel(
+        self,
+        guild_id: int,
+        *,
+        name: str,
+        opener_id: int,
+        category_id: Optional[int],
+        staff_role_id: Optional[int],
+        reason: str,
+    ) -> int:
+        guild = self._find(guild_id)
+        if guild is None:
+            raise OperationError("I'm not in that server any more.")
+        if self.fail_ticket_creation:
+            raise OperationError("I need the Manage Channels permission to open tickets.")
+        if category_id and int(category_id) not in {cid for cid, _ in guild.get("categories", [])}:
+            raise OperationError("The ticket category is no longer in this server. Choose another one in the settings.")
+        channel_id = self._new_id()
+        self._channel_index[channel_id] = (int(guild_id), name)
+        self.created_channels.append(
+            {
+                "id": channel_id,
+                "guild_id": int(guild_id),
+                "name": name,
+                "opener_id": int(opener_id),
+                "category_id": int(category_id) if category_id else None,
+                "staff_role_id": int(staff_role_id) if staff_role_id else None,
+                "reason": reason,
+            }
+        )
+        return channel_id
+
+    async def delete_channel(self, guild_id: int, channel_id: int, *, reason: str) -> None:
+        if int(channel_id) not in self._channel_index:
+            return  # already gone counts as deleted
+        del self._channel_index[int(channel_id)]
+        self.deleted_channels.append(int(channel_id))
+
+    async def set_member_role(self, guild_id: int, user_id: int, role_id: int, *, add: bool) -> None:
+        if self._find(guild_id) is None:
+            raise OperationError("I'm not in that server any more.")
+        self.role_changes.append((int(guild_id), int(user_id), int(role_id), bool(add)))
 
     def _simulated(self, message_id: int, emoji: str, index: int) -> int:
         key = (int(message_id), _norm(emoji))
@@ -245,6 +320,31 @@ def demo_config(guilds: list[dict[str, Any]]) -> dict[str, Any]:
     return cfg
 
 
+async def seed_demo(gateway: DemoGateway, cfg: dict[str, Any]) -> None:
+    """One live poll with some votes, so the results view has something to show."""
+    import operations as ops
+    from audit import Actor
+
+    guild_id = DEMO_GUILDS[0]["id"]
+    staff = Actor(DEMO_MEMBER_IDS[0], "Demo staff", "discord")
+    poll = await ops.create_poll(
+        gateway,
+        cfg,
+        guild_id,
+        staff,
+        question="Which map next Friday?",
+        options=["Dust II", "Inferno", "Nuke", "Overpass"],
+        duration="2d",
+        multiple=True,
+    )
+    # Eight members pick one to three options each. Deterministic, so the demo looks the same each time.
+    picks = [[0], [1, 2], [1], [0, 3], [2], [1], [0, 1, 2], [3]]
+    for offset, choices in enumerate(picks):
+        member = Actor(DEMO_MEMBER_IDS[offset + 1], f"Member {offset + 1}", "discord")
+        for index in choices:
+            await ops.cast_vote(gateway, cfg, guild_id, poll["id"], member, index)
+
+
 async def run_demo(host: str = "127.0.0.1", port: int = 8765) -> None:
     """Serve the dashboard over simulated servers until interrupted."""
     import paths
@@ -257,6 +357,7 @@ async def run_demo(host: str = "127.0.0.1", port: int = 8765) -> None:
 
     gateway = DemoGateway()
     cfg = demo_config(DEMO_GUILDS)
+    await seed_demo(gateway, cfg)
     dashboard = DashboardServer(
         gateway,
         cfg,

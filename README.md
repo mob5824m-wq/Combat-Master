@@ -2,7 +2,7 @@
 
 A [discord.py](https://discordpy.readthedocs.io/) bot for server staff. It posts
 announcements now or later, repeats them on a schedule, runs polls and events,
-welcomes new members, and keeps an audit log of what staff did. A web
+opens support tickets, gives roles from reactions, welcomes new members, and keeps an audit log of what staff did. A web
 dashboard in the same process does the same things from a browser.
 
 It follows the layout of [Sentinel](https://github.com/mob5824m-wq/Sentinel):
@@ -21,8 +21,10 @@ Everything in Discord is one command group, `/manage`. Type `/manage` to see it:
 /manage cancel              cancel a scheduled or repeating announcement
 /manage history             the most recent announcements
 /manage template save|list|delete|use    reusable announcement text
-/manage poll create|list|close           reaction polls, with optional auto-close
+/manage poll create|list|close           polls with vote buttons, single or multiple choice
 /manage event create|list|cancel         events with an RSVP reaction and reminders
+/manage ticket panel|list|close         support tickets that open from a button
+/manage reactionrole add|list|remove    give a role when someone reacts to a message
 /manage welcome set|off|test             the message posted when someone joins
 /manage edit                 change the text of a post the bot made
 /manage delete               delete a post the bot made
@@ -56,10 +58,28 @@ Everything in Discord is one command group, `/manage`. Type `/manage` to see it:
 * **Templates.** Save text once with `/manage template save`, then post it with
   `/manage template use`. Names are unique per server, ignore case, and use
   letters, numbers, spaces, `-` and `_` (up to 40 characters).
-* **Polls.** Two to ten options, one reaction each. Votes are the reactions on
-  the poll message, minus the bot's own. A poll closes when you run
+* **Polls.** Two to ten options, each with its own vote button. Pick one option,
+  or let members pick several (`multiple` on `/manage poll create`, or the
+  checkbox on the dashboard). In a single-choice poll a new vote replaces the old
+  one. Results on the poll update as people vote. A poll closes when you run
   `/manage poll close`, or by itself after the duration you set (1 minute to
-  30 days). The final counts are kept and posted on the poll.
+  30 days). The final counts are kept and posted on the poll. Polls made before
+  this version still count by reaction. The dashboard's Polls tab shows live
+  results, with a bar per option and who chose what.
+* **Tickets.** `/manage ticket panel` posts a button, *Open a ticket*. Pressing it
+  makes a private channel that only the member, the staff role and the bot can
+  see, and each member can have one open ticket at a time. Staff, or the member who
+  opened it, close it with the *Close ticket* button or `/manage ticket close`
+  (leave the number out when you are inside the ticket). Closing deletes the
+  channel. Set the category new channels go in with `/manage setup
+  ticket_category:` or on the dashboard. Opened and closed tickets are written to
+  the audit log.
+* **Reaction roles.** `/manage reactionrole add` links an emoji on a message to a
+  role. The bot adds the emoji to that message, and members who press it get the
+  role. Taking the reaction away takes the role away too. Give the message as a
+  link (*Copy Message Link*), or as an ID with its channel. The bot's role must be
+  above the role it gives. `/manage reactionrole remove` stops the emoji giving
+  roles, and roles people already have are kept.
 * **Events.** Members RSVP with a ✅ reaction. The start must be at least five
   minutes away. If you set a reminder (5 minutes to 7 days before the start),
   the bot posts it once and mentions up to 50 people who RSVP'd.
@@ -124,7 +144,8 @@ In the Developer Portal, open the bot's page:
   **`applications.commands`**. Give the bot these permissions in the channels it
   will use:
   * View Channel, Send Messages, Embed Links
-  * Read Message History and Add Reactions (polls and events)
+  * Read Message History and Add Reactions (polls, events and reaction roles)
+  * Manage Channels (tickets), and Manage Roles (reaction roles)
   * Publish to followers needs the bot to be able to send in that news channel
 
 Invite it to your server with the generated URL.
@@ -184,7 +205,7 @@ Every option is optional, and only the ones you pass are changed.
 
 | Command | Who |
 |---------|-----|
-| Everything except `setup` and `fixcommands` (announce, schedule, repeat, scheduled, cancel, history, template, poll, event, welcome, edit, delete, queue, approve, reject, quiet, pins, status, audit) | Holders of the **staff role**, and administrators |
+| Everything except `setup` and `fixcommands` (announce, schedule, repeat, scheduled, cancel, history, template, poll, ticket, reactionrole, event, welcome, edit, delete, queue, approve, reject, quiet, pins, status, audit) | Holders of the **staff role**, and administrators |
 | `setup`, `fixcommands` | Administrators |
 | The dashboard | Anyone with the dashboard token (see [section 4](#4-the-dashboard)) |
 
@@ -203,8 +224,8 @@ explicit.
 
 The bot starts a web dashboard in the same process. It lists your servers and
 offers the same actions as the commands: announce, schedule and repeat, manage
-templates, polls and events, set welcome messages, change settings, and read
-the audit log. Every button calls the same code as its command, so the two can
+templates, polls (with live results), tickets, reaction roles and events, set
+welcome messages, change settings, and read the audit log. Every button calls the same code as its command, so the two can
 not drift apart.
 
 ### Get the token and sign in
@@ -304,6 +325,7 @@ own timezone. The dashboard shows times in the server's timezone.
 | Template name | 40 characters |
 | Poll question | 256 characters; 2 to 10 options, 100 characters each |
 | Poll duration | 1 minute to 30 days |
+| Open tickets | one per member |
 | Repeat interval | 15 minutes to 365 days |
 | Event title | 256 characters; details 1000 characters |
 | Event reminder | 5 minutes to 7 days before the start (0 for none); mentions up to 50 people |
@@ -319,7 +341,10 @@ bot.py              entry point, the /manage cog, the scheduler loop, command-li
 command_tree.py     the /manage group and the administrator check
 operations.py       every staff action (commands and dashboard both call these)
 announcements.py    time parsing, announcement embeds, posting rules, history, templates
-polls.py            poll options, vote counting, poll storage
+polls.py            poll options, button and reaction votes, vote counting, poll storage
+components.py      the buttons for polls and tickets, which keep working after a restart
+tickets.py         ticket channel names, the panel and welcome messages, ticket storage
+reaction_roles.py  emoji and message parsing for reaction roles, and their storage
 approvals.py        the approval queue: who asked, who decided, reminders
 pins.py             pins that are waiting to be removed
 quiet.py            quiet-hours clock times and the overnight window
@@ -385,9 +410,9 @@ somewhere else.
 
 ## 9. Not included
 
-Combat Master is a staff tool for announcements and events. It does not include
-moderation punishments or warnings, tickets, applications, rules acceptance,
-reaction roles, DuckDNS, music, voice, or a streaming dashboard. Those belong to
+Combat Master is a staff tool for announcements, events, polls, tickets and
+reaction roles. It does not include moderation punishments or warnings,
+applications, rules acceptance, DuckDNS, music, voice, or a streaming dashboard. Those belong to
 other bots and are outside this project.
 
 ## 10. License

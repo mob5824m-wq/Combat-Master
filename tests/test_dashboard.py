@@ -498,6 +498,114 @@ class FeatureRouteTests(DashboardTestCase):
                              ("22:00", "08:00", True))
         self.run_with(scenario)
 
+class VoteTicketRouteTests(DashboardTestCase):
+    """Poll details with live votes, tickets, reaction roles and the ticket category over HTTP."""
+
+    def test_poll_detail_shows_live_counts_and_who_voted(self):
+        async def scenario(client):
+            _, body, cookie = await login(client)
+            headers = auth_headers(cookie, body['csrf'])
+            created = await client.post(
+                f"api/guilds/{GUILD}/polls",
+                json={"question": "Which map?", "options": ["Dust II", "Nuke"], "multiple": True},
+                headers=headers,
+            )
+            self.assertEqual(created.status, 201)
+            poll = await created.json()
+            self.assertTrue(poll["multiple"])
+            pid = poll["id"]
+
+            await ops.cast_vote(self.gw, self.cfg, int(GUILD), pid, Actor(7001, "Zed", "discord"), 1)
+            await ops.cast_vote(self.gw, self.cfg, int(GUILD), pid, Actor(7001, "Zed", "discord"), 0)
+
+            detail = await (await client.get(f"api/guilds/{GUILD}/polls/{pid}", headers=auth_headers(cookie))).json()
+            self.assertEqual(detail["counts"], [1, 1])
+            self.assertEqual(detail["voters_count"], 1)
+            self.assertEqual(detail["voters"][0]["name"], "Zed")
+            self.assertEqual(detail["voters"][0]["choices"], ["Dust II", "Nuke"])
+            self.assertIsInstance(detail["voters"][0]["user_id"], str)
+
+            closed = await client.post(f"api/guilds/{GUILD}/polls/{pid}/close", headers=headers)
+            self.assertEqual(closed.status, 200)
+            final = await (await client.get(f"api/guilds/{GUILD}/polls/{pid}", headers=auth_headers(cookie))).json()
+            self.assertEqual(final["status"], "closed")
+            self.assertEqual(final["counts"], [1, 1])
+
+            missing = await client.get(f"api/guilds/{GUILD}/polls/999", headers=auth_headers(cookie))
+            self.assertEqual(missing.status, 400)
+        self.run_with(scenario)
+
+    def test_ticket_routes_panel_list_and_close(self):
+        async def scenario(client):
+            _, body, cookie = await login(client)
+            headers = auth_headers(cookie, body['csrf'])
+            panel = await client.post(f"api/guilds/{GUILD}/tickets/panel", json={"channel_id": ANNOUNCE}, headers=headers)
+            self.assertEqual(panel.status, 201)
+
+            ticket = await ops.open_ticket(self.gw, self.cfg, int(GUILD), Actor(8001, "Ivy", "discord"))
+            listed = await (await client.get(f"api/guilds/{GUILD}/tickets", headers=auth_headers(cookie))).json()
+            self.assertEqual(len(listed), 1)
+            self.assertEqual(listed[0]["opener_name"], "Ivy")
+            self.assertIsInstance(listed[0]["opener_id"], str)
+
+            closed = await client.post(f"api/guilds/{GUILD}/tickets/{ticket['id']}/close", headers=headers)
+            self.assertEqual(closed.status, 200)
+            still_open = await (await client.get(f"api/guilds/{GUILD}/tickets?open=1", headers=auth_headers(cookie))).json()
+            self.assertEqual(still_open, [])
+        self.run_with(scenario)
+
+    def test_reaction_role_routes_add_list_and_remove(self):
+        member_role = str(DEMO_GUILDS[0]["roles"][1][0])
+        message = asyncio.run(self.gw.post(int(GUILD), int(ANNOUNCE), content="Pick a game"))
+
+        async def scenario(client):
+            _, body, cookie = await login(client)
+            headers = auth_headers(cookie, body['csrf'])
+            added = await client.post(
+                f"api/guilds/{GUILD}/reaction-roles",
+                json={"message": str(message["message_id"]), "emoji": "🎮", "role_id": member_role, "channel_id": ANNOUNCE},
+                headers=headers,
+            )
+            self.assertEqual(added.status, 201)
+            rule = await added.json()
+            listed = await (await client.get(f"api/guilds/{GUILD}/reaction-roles", headers=auth_headers(cookie))).json()
+            self.assertEqual([r["emoji"] for r in listed], ["🎮"])
+            self.assertEqual(listed[0]["role_id"], member_role)
+
+            removed = await client.delete(f"api/guilds/{GUILD}/reaction-roles/{rule['id']}", headers=headers)
+            self.assertEqual(removed.status, 200)
+            self.assertEqual(await (await client.get(f"api/guilds/{GUILD}/reaction-roles", headers=auth_headers(cookie))).json(), [])
+
+            bad = await client.post(
+                f"api/guilds/{GUILD}/reaction-roles",
+                json={"message": "not a message", "emoji": "🎮", "role_id": member_role, "channel_id": ANNOUNCE},
+                headers=headers,
+            )
+            self.assertEqual(bad.status, 400)
+        self.run_with(scenario)
+
+    def test_ticket_category_is_a_setting_and_a_snapshot_dropdown(self):
+        support = str(DEMO_GUILDS[0]["categories"][0][0])
+
+        async def scenario(client):
+            _, body, cookie = await login(client)
+            headers = auth_headers(cookie, body['csrf'])
+            snapshot = await (await client.get(f"api/guilds/{GUILD}/snapshot", headers=auth_headers(cookie))).json()
+            self.assertEqual([c["name"] for c in snapshot["categories"]], ["Support"])
+
+            saved = await client.put(
+                f"api/guilds/{GUILD}/settings", json={"ticket_category_id": support}, headers=headers
+            )
+            self.assertEqual(saved.status, 200)
+            self.assertEqual((await saved.json())["ticket_category_id"], support)
+
+            cleared = await client.put(
+                f"api/guilds/{GUILD}/settings", json={"ticket_category_id": None}, headers=headers
+            )
+            self.assertIsNone((await cleared.json())["ticket_category_id"])
+        self.run_with(scenario)
+
+
 
 if __name__ == "__main__":
     unittest.main()

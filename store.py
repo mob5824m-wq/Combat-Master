@@ -157,6 +157,42 @@ CREATE TABLE IF NOT EXISTS pinned_posts (
     created_at  TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_pins_due ON pinned_posts (status, unpin_at);
+-- One row per vote. A single-choice poll has at most one row per person; a
+-- multiple-choice poll can have one per option they picked.
+CREATE TABLE IF NOT EXISTS poll_votes (
+    poll_id       INTEGER NOT NULL,
+    user_id       INTEGER NOT NULL,
+    voter_name    TEXT NOT NULL DEFAULT '',
+    option_index  INTEGER NOT NULL,
+    voted_at      TEXT NOT NULL,            -- UTC
+    PRIMARY KEY (poll_id, user_id, option_index)
+);
+-- Support tickets: each opens a private channel. channel_id is unique, so a
+-- channel maps to exactly one ticket.
+CREATE TABLE IF NOT EXISTS tickets (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    guild_id     INTEGER NOT NULL,
+    channel_id   INTEGER NOT NULL UNIQUE,
+    opener_id    INTEGER NOT NULL,
+    opener_name  TEXT NOT NULL DEFAULT '',
+    status       TEXT NOT NULL DEFAULT 'open',  -- open | closed
+    created_at   TEXT NOT NULL,              -- UTC
+    closed_at    TEXT,
+    closed_by    TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_tickets_guild ON tickets (guild_id, status);
+-- Give a role when a member adds an emoji to a message, and take it away when
+-- they remove it. The emoji is stored in the normalised form from reaction_roles.
+CREATE TABLE IF NOT EXISTS reaction_roles (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    guild_id     INTEGER NOT NULL,
+    channel_id   INTEGER NOT NULL,
+    message_id   INTEGER NOT NULL,
+    emoji        TEXT NOT NULL,
+    role_id      INTEGER NOT NULL,
+    created_at   TEXT NOT NULL,
+    UNIQUE (message_id, emoji)
+);
 """
 
 # Columns added after a first release. (table, column, declaration)
@@ -170,6 +206,9 @@ _ADDED_COLUMNS = [
     ("announcements", "edited_at", "TEXT"),
     ("announcements", "deleted_at", "TEXT"),
     ("scheduled_announcements", "pin_seconds", "INTEGER"),
+    # 'reactions' is the default so polls made before buttons existed keep their old behaviour.
+    ("polls", "mode", "TEXT NOT NULL DEFAULT 'reactions'"),  # buttons | reactions
+    ("polls", "multiple", "INTEGER NOT NULL DEFAULT 0"),
 ]
 
 
@@ -212,6 +251,18 @@ def db_insert(query: str, params: tuple = ()) -> int:
         cur = conn.execute(query, params)
         conn.commit()
         return int(cur.lastrowid)
+
+
+def db_transaction(work):
+    """Run ``work(conn)`` as one transaction: commit if it returns, roll back if it raises."""
+    with closing(_connect()) as conn:
+        try:
+            result = work(conn)
+            conn.commit()
+            return result
+        except Exception:
+            conn.rollback()
+            raise
 
 
 def db_fetchall(query: str, params: tuple = ()) -> list[dict[str, Any]]:

@@ -196,3 +196,8 @@ button.small { padding: 0.2rem 0.55rem; font-size: 0.85rem; }
   .grid { grid-template-columns: 1fr; }
   .grid .span2 { grid-column: auto; }
 }
+
+/* Poll results: a bar per option, filled by dashboard.js */
+.poll-detail { margin-top: 1rem; border-top: 1px solid var(--line); padding-top: 0.5rem; }
+.poll-bar { height: 0.45rem; background: var(--line); border-radius: 4px; overflow: hidden; margin-top: 0.3rem; }
+.poll-bar-fill { height: 100%; width: 0; background: var(--accent); }

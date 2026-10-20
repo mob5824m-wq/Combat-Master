@@ -33,6 +33,9 @@ sys.path.insert(0, str(REPO_ROOT))
 from discord import app_commands  # noqa: E402
 
 import audit  # noqa: E402
+import operations as ops  # noqa: E402
+import polls  # noqa: E402
+from audit import Actor  # noqa: E402
 import announcements as ann  # noqa: E402
 import bot as bot_module  # noqa: E402
 import command_tree  # noqa: E402
@@ -46,6 +49,7 @@ GENERAL = 100000000000000102
 STAFF_LOG = 100000000000000105
 STAFF_ROLE = 100000000000000201
 MEMBER_ROLE = 100000000000000202
+SUPPORT_CATEGORY = 100000000000000901
 
 _REGISTERED = False
 
@@ -137,10 +141,12 @@ class CommandTreeTests(unittest.TestCase):
             set(top),
             {"announce", "schedule", "repeat", "scheduled", "cancel", "history", "template",
              "poll", "event", "welcome", "status", "audit", "setup", "fixcommands",
-             "queue", "approve", "reject", "edit", "delete", "quiet", "pins"},
+             "queue", "approve", "reject", "edit", "delete", "quiet", "pins", "ticket", "reactionrole"},
         )
         self.assertEqual({c.name for c in top["template"].commands}, {"save", "list", "delete", "use"})
         self.assertEqual({c.name for c in top["poll"].commands}, {"create", "list", "close"})
+        self.assertEqual({c.name for c in top["ticket"].commands}, {"panel", "list", "close"})
+        self.assertEqual({c.name for c in top["reactionrole"].commands}, {"add", "list", "remove"})
         self.assertEqual({c.name for c in top["event"].commands}, {"create", "list", "cancel"})
         self.assertEqual({c.name for c in top["welcome"].commands}, {"set", "off", "test"})
 
@@ -469,6 +475,99 @@ class CommandFeatureTests(unittest.TestCase):
         self.call("manage_pins", outsider)
         self.assertEqual(settings.get_quiet_hours(bot_module.bot.config, GUILD), (None, None))
         self.assertEqual(self.announcement_posts(), [])
+
+
+class TicketAndRoleCommandTests(unittest.TestCase):
+    """The /manage ticket, /manage reactionrole and poll multiple-choice commands, end to end."""
+
+    call = CommandHandlerTests.call
+
+    def setUp(self) -> None:
+        ensure_cog_registered()
+        self._tmp = tempfile.TemporaryDirectory()
+        self._old = os.environ.get("COMBAT_MASTER_DATA")
+        os.environ["COMBAT_MASTER_DATA"] = self._tmp.name
+        store.init_db()
+        self.gw = DemoGateway()
+        self.cfg = copy.deepcopy(settings.DEFAULT_CONFIG)
+        settings.set_guild_value(self.cfg, GUILD, "announcement_channel_id", ANNOUNCE)
+        settings.set_guild_value(self.cfg, GUILD, "staff_channel_id", STAFF_LOG)
+        settings.set_guild_value(self.cfg, GUILD, "staff_role_id", STAFF_ROLE)
+        bot_module.bot.gateway = self.gw
+        bot_module.bot.config = self.cfg
+        self.cog = bot_module.bot.get_cog("CombatMasterCog")
+
+    def tearDown(self) -> None:
+        if self._old is None:
+            os.environ.pop("COMBAT_MASTER_DATA", None)
+        else:
+            os.environ["COMBAT_MASTER_DATA"] = self._old
+        self._tmp.cleanup()
+
+    def test_ticket_panel_is_staff_only_and_posts_a_button(self):
+        outsider = fake_interaction()
+        self.call("ticket_panel", outsider, channel=None)
+        self.assertEqual(self.gw.posts, [])
+        staff = fake_interaction(roles=[STAFF_ROLE])
+        self.call("ticket_panel", staff, channel=None)
+        self.assertIn("Ticket button posted", staff.followup.last_text)
+        self.assertEqual(len([p for p in self.gw.posts if p["channel_id"] == ANNOUNCE]), 1)
+
+    def test_ticket_list_and_close_from_inside_the_ticket(self):
+        empty = fake_interaction(roles=[STAFF_ROLE])
+        self.call("ticket_list", empty)
+        self.assertIn("No tickets are open", empty.followup.last_text)
+
+        ticket = asyncio.run(ops.open_ticket(self.gw, self.cfg, GUILD, Actor(1001, "Alice", "discord")))
+        listing = fake_interaction(roles=[STAFF_ROLE])
+        self.call("ticket_list", listing)
+        self.assertIn(f"**#{ticket['id']}**", listing.followup.last_text)
+
+        elsewhere = fake_interaction(roles=[STAFF_ROLE])
+        elsewhere.channel_id = ANNOUNCE
+        self.call("ticket_close", elsewhere, ticket_id=None)
+        self.assertIn("Run this inside a ticket", elsewhere.followup.last_text)
+
+        inside = fake_interaction(roles=[STAFF_ROLE])
+        inside.channel_id = int(ticket["channel_id"])
+        self.call("ticket_close", inside, ticket_id=None)
+        self.assertIn(f"Closed ticket **#{ticket['id']}**", inside.followup.last_text)
+        self.assertIn(int(ticket["channel_id"]), self.gw.deleted_channels)
+
+    def test_reaction_role_add_list_and_remove(self):
+        message_id = asyncio.run(self.gw.post(GUILD, ANNOUNCE, content="Pick"))["message_id"]
+        staff = fake_interaction(roles=[STAFF_ROLE])
+        role = SimpleNamespace(id=MEMBER_ROLE, name="Member", mention=f"<@&{MEMBER_ROLE}>")
+        self.call("reactionrole_add", staff, message=str(message_id), emoji="🎮", role=role, channel=None)
+        self.assertIn("Reaction role **#1**", staff.followup.last_text)
+
+        listing = fake_interaction(roles=[STAFF_ROLE])
+        self.call("reactionrole_list", listing)
+        self.assertIn(f"<@&{MEMBER_ROLE}>", listing.followup.last_text)
+
+        removal = fake_interaction(roles=[STAFF_ROLE])
+        self.call("reactionrole_remove", removal, rule_id=1)
+        self.assertIn("Removed reaction role **#1**", removal.followup.last_text)
+        self.assertEqual(ops.list_reaction_roles(GUILD), [])
+
+    def test_reaction_role_refusals_are_shown_to_staff(self):
+        staff = fake_interaction(roles=[STAFF_ROLE])
+        role = SimpleNamespace(id=MEMBER_ROLE, name="Member", mention="")
+        self.call("reactionrole_add", staff, message="https://example.com/nope", emoji="🎮", role=role, channel=None)
+        self.assertIn("message link", staff.followup.last_text)
+
+    def test_poll_create_with_multiple_choice(self):
+        staff = fake_interaction(roles=[STAFF_ROLE])
+        self.call("poll_create", staff, question="Which games?", options="Chess | Go",
+                  duration=None, channel=None, multiple=True)
+        self.assertIn("several options", staff.followup.last_text)
+        self.assertTrue(polls.get_poll(GUILD, 1)["multiple"])
+
+    def test_setup_sets_the_ticket_category(self):
+        admin = fake_interaction(admin=True)
+        category = SimpleNamespace(id=SUPPORT_CATEGORY, name="Support")
+        self.call("setup_cmd", admin, ticket_category=category)
+        self.assertEqual(settings.get_ticket_category_id(self.cfg, GUILD), SUPPORT_CATEGORY)
 
 
 if __name__ == "__main__":

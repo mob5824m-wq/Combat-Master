@@ -228,16 +228,34 @@ class PollTests(OpsTestCase):
         ))
         self.assertEqual(result["options"], ["Tuesday", "Friday", "Sunday"])
 
-    def test_votes_are_reactions_minus_the_bots_own(self):
-        poll = self.create()
-        message_id = int(poll["message_id"])
-        self.gw.counts[(message_id, _norm(polls.EMOJIS[0]))] = 4  # bot + 3 members
-        self.gw.counts[(message_id, _norm(polls.EMOJIS[1]))] = 2  # bot + 1 member
-        result = run(ops.close_poll(self.gw, self.cfg, GUILD, STAFF, poll["id"], now=NOW))
+    def test_legacy_reaction_poll_counts_reactions_minus_the_bots_own(self):
+        # A poll made before buttons existed: its votes are reactions, not rows in poll_votes.
+        message = run(self.gw.post(GUILD, ANNOUNCE, content="old poll"))
+        poll_id = polls.create_poll(
+            guild_id=GUILD, channel_id=ANNOUNCE, author_id=STAFF.id, question="Old poll",
+            options=["Tuesday", "Friday"], ends_at=None, now=NOW, mode=polls.MODE_REACTIONS,
+        )
+        polls.attach_message(poll_id, message["message_id"])
+        self.gw.counts[(message["message_id"], _norm(polls.EMOJIS[0]))] = 4  # bot + 3 members
+        self.gw.counts[(message["message_id"], _norm(polls.EMOJIS[1]))] = 2  # bot + 1 member
+        result = run(ops.close_poll(self.gw, self.cfg, GUILD, STAFF, poll_id, now=NOW))
         self.assertEqual(result["votes"], [3, 1])
         self.assertEqual(ops.list_polls(GUILD)[0]["status"], "closed")
         with self.assertRaises(OperationError):
-            run(ops.close_poll(self.gw, self.cfg, GUILD, STAFF, poll["id"], now=NOW))
+            run(ops.close_poll(self.gw, self.cfg, GUILD, STAFF, poll_id, now=NOW))
+
+    def test_new_polls_are_button_polls_with_no_reactions_to_count(self):
+        poll = self.create()
+        row = polls.get_poll(GUILD, poll["id"])
+        self.assertEqual(row["mode"], polls.MODE_BUTTONS)
+        self.assertFalse(row["multiple"])
+        view = self.gw.messages[(ANNOUNCE, int(poll["message_id"]))]["view"]
+        self.assertEqual([b["custom_id"] for b in view], [f"cm:poll:{poll['id']}:0", f"cm:poll:{poll['id']}:1"])
+        # Closing with no votes: the tally comes from the database, and the buttons are removed.
+        result = run(ops.close_poll(self.gw, self.cfg, GUILD, STAFF, poll["id"], now=NOW))
+        self.assertEqual(result["votes"], [0, 0])
+        self.assertEqual(result["voters"], 0)
+        self.assertIsNone(self.gw.messages[(ANNOUNCE, int(poll["message_id"]))]["view"])
 
     def test_option_count_is_checked(self):
         with self.assertRaises(OperationError):
