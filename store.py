@@ -193,6 +193,35 @@ CREATE TABLE IF NOT EXISTS reaction_roles (
     created_at   TEXT NOT NULL,
     UNIQUE (message_id, emoji)
 );
+-- The saved conversation of a closed ticket, kept for staff to read or download.
+CREATE TABLE IF NOT EXISTS ticket_transcripts (
+    ticket_id      INTEGER PRIMARY KEY,
+    guild_id       INTEGER NOT NULL,
+    text           TEXT NOT NULL,
+    message_count  INTEGER NOT NULL,
+    created_at     TEXT NOT NULL              -- UTC
+);
+-- Role menus: a message with a dropdown that lets members pick their own roles.
+-- message_id is set once the menu is posted; a menu can be re-posted.
+CREATE TABLE IF NOT EXISTS role_menus (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    guild_id     INTEGER NOT NULL,
+    title        TEXT NOT NULL,
+    description  TEXT NOT NULL DEFAULT '',
+    channel_id   INTEGER,
+    message_id   INTEGER,
+    author_id    INTEGER NOT NULL,
+    created_at   TEXT NOT NULL                -- UTC
+);
+CREATE INDEX IF NOT EXISTS idx_role_menus_guild ON role_menus (guild_id);
+CREATE TABLE IF NOT EXISTS role_menu_options (
+    menu_id      INTEGER NOT NULL,
+    role_id      INTEGER NOT NULL,
+    label        TEXT NOT NULL,
+    description  TEXT NOT NULL DEFAULT '',
+    position     INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (menu_id, role_id)
+);
 """
 
 # Columns added after a first release. (table, column, declaration)
@@ -209,6 +238,11 @@ _ADDED_COLUMNS = [
     # 'reactions' is the default so polls made before buttons existed keep their old behaviour.
     ("polls", "mode", "TEXT NOT NULL DEFAULT 'reactions'"),  # buttons | reactions
     ("polls", "multiple", "INTEGER NOT NULL DEFAULT 0"),
+    # Scheduled polls: send_at is when to post; the close time is counted from posting.
+    ("polls", "send_at", "TEXT"),
+    ("polls", "duration_seconds", "INTEGER"),
+    # Ticket auto-close counts idle time from the last message by someone other than the bot.
+    ("tickets", "last_activity_at", "TEXT"),
 ]
 
 

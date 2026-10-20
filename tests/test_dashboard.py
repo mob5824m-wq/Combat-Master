@@ -607,5 +607,121 @@ class VoteTicketRouteTests(DashboardTestCase):
 
 
 
+GENERAL = "100000000000000102"
+
+
+class UpkeepRouteTests(DashboardTestCase):
+    """Transcripts, role menus, scheduled polls and the auto-close setting over HTTP."""
+
+    def test_a_closed_ticket_transcript_downloads_as_a_text_file(self):
+        async def scenario(client):
+            _, body, cookie = await login(client)
+            headers = auth_headers(cookie, body["csrf"])
+            ticket = await ops.open_ticket(self.gw, self.cfg, int(GUILD), Actor(7001, "Zed", "discord"))
+            self.gw.say(int(ticket["channel_id"]), "Zed", "Where do I vote?")
+            tid = ticket["id"]
+
+            early = await client.get(f"api/guilds/{GUILD}/tickets/{tid}/transcript", headers=auth_headers(cookie))
+            self.assertEqual(early.status, 400)
+
+            closed = await client.post(f"api/guilds/{GUILD}/tickets/{tid}/close", headers=headers)
+            self.assertEqual(closed.status, 200)
+
+            saved = await client.get(f"api/guilds/{GUILD}/tickets/{tid}/transcript", headers=auth_headers(cookie))
+            self.assertEqual(saved.status, 200)
+            self.assertTrue(saved.headers["Content-Type"].startswith("text/plain"))
+            self.assertIn(f"ticket-{tid}.txt", saved.headers["Content-Disposition"])
+            self.assertIn("Zed: Where do I vote?", await saved.text())
+        self.run_with(scenario)
+
+    def test_role_menu_routes_build_post_and_delete_a_menu(self):
+        async def scenario(client):
+            _, body, cookie = await login(client)
+            headers = auth_headers(cookie, body["csrf"])
+
+            empty_title = await client.post(f"api/guilds/{GUILD}/role-menus", json={"title": " "}, headers=headers)
+            self.assertEqual(empty_title.status, 400)
+
+            created = await client.post(
+                f"api/guilds/{GUILD}/role-menus",
+                json={"title": "Games", "description": "Pick your games."},
+                headers=headers,
+            )
+            self.assertEqual(created.status, 201)
+            menu_id = (await created.json())["id"]
+
+            no_roles = await client.post(
+                f"api/guilds/{GUILD}/role-menus/{menu_id}/post", json={"channel_id": GENERAL}, headers=headers
+            )
+            self.assertEqual(no_roles.status, 400)
+
+            added = await client.post(
+                f"api/guilds/{GUILD}/role-menus/{menu_id}/options",
+                json={"role_id": "100000000000000202", "label": "Member"},
+                headers=headers,
+            )
+            self.assertEqual(added.status, 201)
+            self.assertIsInstance((await added.json())["role_id"], str)
+
+            listed = await (await client.get(f"api/guilds/{GUILD}/role-menus", headers=auth_headers(cookie))).json()
+            self.assertEqual(listed[0]["title"], "Games")
+            self.assertEqual(listed[0]["options"][0]["label"], "Member")
+
+            posted = await client.post(
+                f"api/guilds/{GUILD}/role-menus/{menu_id}/post", json={"channel_id": GENERAL}, headers=headers
+            )
+            self.assertEqual(posted.status, 201)
+
+            removed = await client.delete(
+                f"api/guilds/{GUILD}/role-menus/{menu_id}/options/100000000000000202", headers=headers
+            )
+            self.assertEqual(removed.status, 200)
+
+            deleted = await client.delete(f"api/guilds/{GUILD}/role-menus/{menu_id}", headers=headers)
+            self.assertEqual(deleted.status, 200)
+            self.assertEqual(await (await client.get(f"api/guilds/{GUILD}/role-menus", headers=auth_headers(cookie))).json(), [])
+        self.run_with(scenario)
+
+    def test_role_menu_writes_need_the_csrf_header(self):
+        async def scenario(client):
+            _, _, cookie = await login(client)
+            refused = await client.post(
+                f"api/guilds/{GUILD}/role-menus", json={"title": "Games"}, headers=auth_headers(cookie)
+            )
+            self.assertEqual(refused.status, 403)
+        self.run_with(scenario)
+
+    def test_a_scheduled_poll_is_created_over_http_and_listed_as_scheduled(self):
+        async def scenario(client):
+            _, body, cookie = await login(client)
+            headers = auth_headers(cookie, body["csrf"])
+            created = await client.post(
+                f"api/guilds/{GUILD}/polls",
+                json={"question": "Pizza?", "options": ["Yes", "No"], "send_at": "2h"},
+                headers=headers,
+            )
+            self.assertEqual(created.status, 201)
+            result = await created.json()
+            self.assertTrue(result["scheduled"])
+            listed = await (await client.get(f"api/guilds/{GUILD}/polls", headers=auth_headers(cookie))).json()
+            self.assertEqual(listed[0]["status"], "scheduled")
+        self.run_with(scenario)
+
+    def test_the_auto_close_setting_is_saved_and_validated(self):
+        async def scenario(client):
+            _, body, cookie = await login(client)
+            headers = auth_headers(cookie, body["csrf"])
+            saved = await client.put(
+                f"api/guilds/{GUILD}/settings", json={"ticket_auto_close_days": 3}, headers=headers
+            )
+            self.assertEqual(saved.status, 200)
+            self.assertEqual((await saved.json())["ticket_auto_close_days"], 3)
+            bad = await client.put(
+                f"api/guilds/{GUILD}/settings", json={"ticket_auto_close_days": 900}, headers=headers
+            )
+            self.assertEqual(bad.status, 400)
+        self.run_with(scenario)
+
+
 if __name__ == "__main__":
     unittest.main()

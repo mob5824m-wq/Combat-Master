@@ -70,6 +70,7 @@ DEFAULT_GUILD: dict[str, Any] = {
     "quiet_end": None,
     "quiet_hold_manual": False,  # True -> announcements made by hand wait for quiet hours to end too
     "ticket_category_id": None,  # category that new ticket channels go in; None -> top level
+    "ticket_auto_close_days": 0,  # close a ticket after this many idle days; 0 -> never
 }
 
 # Keys a dashboard or command may change, and the type each one takes.
@@ -171,6 +172,10 @@ def get_quiet_hold_manual(cfg: dict[str, Any], guild_id: int) -> bool:
 
 def get_ticket_category_id(cfg: dict[str, Any], guild_id: int) -> Optional[int]:
     return _as_id(get_guild_config(cfg, guild_id)["ticket_category_id"])
+
+
+def get_ticket_auto_close_days(cfg: dict[str, Any], guild_id: int) -> int:
+    return int(get_guild_config(cfg, guild_id)["ticket_auto_close_days"] or 0)
 
 
 def get_timezone_name(cfg: dict[str, Any], guild_id: int) -> str:

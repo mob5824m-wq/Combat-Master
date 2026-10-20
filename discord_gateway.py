@@ -7,6 +7,7 @@ so every caller handles one exception type.
 
 from __future__ import annotations
 
+import io
 from typing import Any, Optional
 
 import discord
@@ -17,6 +18,18 @@ from operations import OperationError
 
 # Discord returns some emoji with a variation selector (U+FE0F) and others
 # without. Compare them with it removed.
+def _message_text(message: discord.Message) -> str:
+    """The message's words, or for a bot's embed-only message, the embed's title and text."""
+    if message.content:
+        return message.content
+    parts = []
+    for embed in message.embeds:
+        text = ": ".join(part for part in (embed.title, embed.description) if part)
+        if text:
+            parts.append(text)
+    return "\n".join(parts)
+
+
 def _norm(emoji: str) -> str:
     return str(emoji).replace("\ufe0f", "")
 
@@ -177,6 +190,51 @@ class DiscordGateway:
                 await message.edit(embed=embed)  # leaving view out keeps them
         except discord.HTTPException as exc:
             raise OperationError(f"Could not update the message ({exc}).") from None
+
+    async def edit_message(
+        self,
+        guild_id: int,
+        channel_id: int,
+        message_id: int,
+        *,
+        embed: discord.Embed,
+        view: Optional[list[dict[str, Any]]] = None,
+    ) -> None:
+        message = await self._message(guild_id, channel_id, message_id)
+        try:
+            await message.edit(embed=embed, view=build_view(view) if view else None)
+        except discord.HTTPException as exc:
+            raise OperationError(f"Could not update the message ({exc}).") from None
+
+    async def read_history(self, guild_id: int, channel_id: int, limit: int) -> list[dict[str, Any]]:
+        channel = await self._channel(guild_id, channel_id)
+        rows: list[dict[str, Any]] = []
+        try:
+            async for message in channel.history(limit=int(limit), oldest_first=True):
+                rows.append(
+                    {
+                        "author": message.author.display_name,
+                        "author_id": message.author.id,
+                        "bot": bool(message.author.bot),
+                        "created_at": message.created_at,  # timezone-aware, UTC
+                        "content": _message_text(message),
+                        "attachments": [attachment.url for attachment in message.attachments],
+                    }
+                )
+        except discord.HTTPException as exc:
+            raise OperationError(f"Could not read the channel ({exc}).") from None
+        return rows
+
+    async def post_file(self, guild_id: int, channel_id: int, *, content: str, filename: str, data: bytes) -> None:
+        channel = await self._channel(guild_id, channel_id)
+        try:
+            await channel.send(
+                content=content,
+                file=discord.File(io.BytesIO(data), filename=filename),
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+        except discord.HTTPException as exc:
+            raise OperationError(f"Could not post the file ({exc}).") from None
 
     async def delete_message(self, guild_id: int, channel_id: int, message_id: int) -> None:
         channel = await self._channel(guild_id, channel_id)

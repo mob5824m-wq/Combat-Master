@@ -148,10 +148,14 @@ def create_poll(
     now: Optional[datetime] = None,
     mode: str = MODE_BUTTONS,
     multiple: bool = False,
+    send_at: Optional[datetime] = None,
+    duration_seconds: Optional[int] = None,
 ) -> int:
+    """Store a poll. With ``send_at`` it is ``scheduled`` until the scheduler posts it."""
+    scheduled = send_at is not None
     return store.db_insert(
         "INSERT INTO polls (guild_id, channel_id, question, options, author_id, created_at, ends_at, status, "
-        "mode, multiple) VALUES (?, ?, ?, ?, ?, ?, ?, 'open', ?, ?)",
+        "mode, multiple, send_at, duration_seconds) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (
             int(guild_id),
             int(channel_id),
@@ -159,11 +163,39 @@ def create_poll(
             json.dumps(options),
             int(author_id),
             iso_utc(now or datetime.now(timezone.utc)),
-            iso_utc(ends_at) if ends_at else None,
+            iso_utc(ends_at) if ends_at and not scheduled else None,
+            "scheduled" if scheduled else "open",
             mode,
             1 if multiple else 0,
+            iso_utc(send_at) if scheduled else None,
+            int(duration_seconds) if duration_seconds else None,
         ),
     )
+
+
+def activate(poll_id: int, message_id: int, ends_at: Optional[datetime]) -> bool:
+    """A scheduled poll has been posted: it is open now, with its close time counted from here."""
+    changed = store.db_execute(
+        "UPDATE polls SET status = 'open', message_id = ?, ends_at = ? WHERE id = ? AND status = 'scheduled'",
+        (int(message_id), iso_utc(ends_at) if ends_at else None, int(poll_id)),
+    )
+    return changed > 0
+
+
+def list_due_scheduled(now: datetime) -> list[dict[str, Any]]:
+    rows = store.db_fetchall(
+        "SELECT * FROM polls WHERE status = 'scheduled' AND send_at <= ? ORDER BY send_at",
+        (iso_utc(now),),
+    )
+    return [_decode(row) for row in rows]
+
+
+def set_status(poll_id: int, status: str, *, only_from: str) -> bool:
+    """Move a poll to ``status`` if it is still in ``only_from``. Returns whether it changed."""
+    changed = store.db_execute(
+        "UPDATE polls SET status = ? WHERE id = ? AND status = ?", (status, int(poll_id), only_from)
+    )
+    return changed > 0
 
 
 def attach_message(poll_id: int, message_id: int) -> None:

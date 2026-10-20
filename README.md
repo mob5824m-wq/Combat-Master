@@ -24,6 +24,7 @@ Everything in Discord is one command group, `/manage`. Type `/manage` to see it:
 /manage poll create|list|close           polls with vote buttons, single or multiple choice
 /manage event create|list|cancel         events with an RSVP reaction and reminders
 /manage ticket panel|list|close         support tickets that open from a button
+/manage rolemenu new|add|remove|post|list|delete    a dropdown that gives and takes roles
 /manage reactionrole add|list|remove    give a role when someone reacts to a message
 /manage welcome set|off|test             the message posted when someone joins
 /manage edit                 change the text of a post the bot made
@@ -63,7 +64,11 @@ Everything in Discord is one command group, `/manage`. Type `/manage` to see it:
   checkbox on the dashboard). In a single-choice poll a new vote replaces the old
   one. Results on the poll update as people vote. A poll closes when you run
   `/manage poll close`, or by itself after the duration you set (1 minute to
-  30 days). The final counts are kept and posted on the poll. Polls made before
+  30 days). `send_at` (on `/manage poll create`, or *Post at* on the dashboard)
+  posts the poll later instead, such as `2h` or `2026-10-24 18:00`. The duration
+  counts from when it is posted, and you can cancel a scheduled poll with
+  `/manage poll close` before it goes out. Quiet hours do not hold scheduled
+  polls. The final counts are kept and posted on the poll. Polls made before
   this version still count by reaction. The dashboard's Polls tab shows live
   results, with a bar per option and who chose what.
 * **Tickets.** `/manage ticket panel` posts a button, *Open a ticket*. Pressing it
@@ -74,12 +79,28 @@ Everything in Discord is one command group, `/manage`. Type `/manage` to see it:
   channel. Set the category new channels go in with `/manage setup
   ticket_category:` or on the dashboard. Opened and closed tickets are written to
   the audit log.
+  **Transcripts.** Before the channel is deleted, the bot saves what was said in
+  it: each message with its time, author and attachment links. The transcript is
+  posted to the staff log as a text file and kept for the dashboard's Tickets tab,
+  where staff can download it. A ticket that could not be read is still closed,
+  and the staff log says no transcript was kept.
+  **Idle close.** Set *Close idle tickets after* on the dashboard (in days, 0 for
+  never). A ticket with no new messages for that long is closed the same way, and
+  the bot says why in the ticket before it goes. Messages from members and staff
+  reset the clock. The bot's own messages do not.
 * **Reaction roles.** `/manage reactionrole add` links an emoji on a message to a
   role. The bot adds the emoji to that message, and members who press it get the
   role. Taking the reaction away takes the role away too. Give the message as a
   link (*Copy Message Link*), or as an ID with its channel. The bot's role must be
   above the role it gives. `/manage reactionrole remove` stops the emoji giving
   roles, and roles people already have are kept.
+* **Role menus.** Use these when members should choose their own roles. A menu is
+  one message with a dropdown. `/manage rolemenu new`, then `add` (up to 25 roles,
+  each with an optional label and note), then `post`. A member picks the roles they
+  want, and any menu role they leave unticked is taken away. Roles outside the menu
+  are never touched. Use *reaction roles* for a single role on one message. Use a role menu
+  for a list. Changing a menu's roles updates the posted message. Deleting the menu
+  removes the message, and people keep the roles they already have.
 * **Events.** Members RSVP with a ✅ reaction. The start must be at least five
   minutes away. If you set a reminder (5 minutes to 7 days before the start),
   the bot posts it once and mentions up to 50 people who RSVP'd.
@@ -138,14 +159,17 @@ Everything in Discord is one command group, `/manage`. Type `/manage` to see it:
 
 In the Developer Portal, open the bot's page:
 
-* Under *Bot → Privileged Gateway Intents*, switch on **Server Members Intent**.
-  Without it, welcome messages do not work. Everything else still does.
+* Under *Bot → Privileged Gateway Intents*, switch on **Server Members Intent**
+  and **Message Content Intent**. Members is for welcome messages. Message Content
+  lets the bot save ticket transcripts, and it does not act on what members write.
+  Discord refuses to start the bot if either privileged intent is switched off here
+  while the bot asks for it.
 * Under *OAuth2 → URL Generator*, select the scopes **`bot`** and
   **`applications.commands`**. Give the bot these permissions in the channels it
   will use:
   * View Channel, Send Messages, Embed Links
   * Read Message History and Add Reactions (polls, events and reaction roles)
-  * Manage Channels (tickets), and Manage Roles (reaction roles)
+  * Manage Channels (tickets), and Manage Roles (reaction roles and role menus)
   * Publish to followers needs the bot to be able to send in that news channel
 
 Invite it to your server with the generated URL.
@@ -224,7 +248,8 @@ explicit.
 
 The bot starts a web dashboard in the same process. It lists your servers and
 offers the same actions as the commands: announce, schedule and repeat, manage
-templates, polls (with live results), tickets, reaction roles and events, set
+templates, polls (with live results and scheduled polls), tickets (with transcripts
+and idle close), reaction roles, role menus and events, set
 welcome messages, change settings, and read the audit log. Every button calls the same code as its command, so the two can
 not drift apart.
 
@@ -313,6 +338,7 @@ install.
 | `2026-10-20T18:00` | Same, with a `T` between date and time |
 
 A scheduled time must be at least one minute away and at most 365 days away.
+Scheduled polls use the same times.
 Replies show the time as a Discord timestamp, so each person sees it in their
 own timezone. The dashboard shows times in the server's timezone.
 
@@ -326,6 +352,9 @@ own timezone. The dashboard shows times in the server's timezone.
 | Poll question | 256 characters; 2 to 10 options, 100 characters each |
 | Poll duration | 1 minute to 30 days |
 | Open tickets | one per member |
+| Idle ticket close | 0 (never), or 1 to 365 days |
+| Role menu | up to 25 roles; title 256 characters; text above 1000 characters; label and note 100 characters each |
+| Ticket transcript | the first 1000 messages of a ticket, kept after the channel is deleted; the staff log gets a text file |
 | Repeat interval | 15 minutes to 365 days |
 | Event title | 256 characters; details 1000 characters |
 | Event reminder | 5 minutes to 7 days before the start (0 for none); mentions up to 50 people |
@@ -343,7 +372,8 @@ operations.py       every staff action (commands and dashboard both call these)
 announcements.py    time parsing, announcement embeds, posting rules, history, templates
 polls.py            poll options, button and reaction votes, vote counting, poll storage
 components.py      the buttons for polls and tickets, which keep working after a restart
-tickets.py         ticket channel names, the panel and welcome messages, ticket storage
+tickets.py         ticket channel names, the panel and welcome messages, transcripts, idle close
+role_menus.py      role menus: the dropdown, its roles, and what a pick changes
 reaction_roles.py  emoji and message parsing for reaction roles, and their storage
 approvals.py        the approval queue: who asked, who decided, reminders
 pins.py             pins that are waiting to be removed
@@ -411,7 +441,7 @@ somewhere else.
 ## 9. Not included
 
 Combat Master is a staff tool for announcements, events, polls, tickets and
-reaction roles. It does not include moderation punishments or warnings,
+reaction roles, role menus. It does not include moderation punishments or warnings,
 applications, rules acceptance, DuckDNS, music, voice, or a streaming dashboard. Those belong to
 other bots and are outside this project.
 

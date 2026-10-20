@@ -144,6 +144,9 @@ button:disabled { opacity: 0.6; cursor: wait; }
 button.ghost { background: transparent; color: var(--text); border-color: var(--line); }
 button.danger { background: transparent; color: var(--danger); border-color: var(--danger); }
 button.small { padding: 0.2rem 0.55rem; font-size: 0.85rem; }
+a.button-link { display: inline-block; padding: 0.2rem 0.55rem; font-size: 0.85rem; border: 1px solid var(--line); border-radius: 6px; color: var(--text); text-decoration: none; }
+.menu-row .actions { margin-top: 0.4rem; }
+.menu-option { display: flex; align-items: center; gap: 0.5rem; padding: 0.15rem 0; }
 
 .grid {
   display: grid;

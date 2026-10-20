@@ -344,6 +344,7 @@
     form.elements.quiet_end.value = s.quiet_end || "";
     form.elements.quiet_hold_manual.checked = Boolean(s.quiet_hold_manual);
     form.elements.ticket_category_id.value = s.ticket_category_id ? String(s.ticket_category_id) : "";
+    form.elements.ticket_auto_close_days.value = String(s.ticket_auto_close_days || 0);
   }
 
   function fillWelcomeForm() {
@@ -389,7 +390,10 @@
     templates: loadTemplates,
     polls: loadPolls,
     tickets: loadTickets,
-    roles: loadRoles,
+    roles: async () => {
+      await loadRoles();
+      await loadRoleMenus();
+    },
     events: loadEvents,
     welcome: async () => {},
     settings: async () => {},
@@ -741,11 +745,15 @@
           question: f.get("question"),
           options,
           duration: opt(f, "duration"),
+          send_at: opt(f, "send_at"),
           channel_id: opt(f, "channel_id"),
           multiple: f.has("multiple"),
         },
       }),
-      (r) => `Poll #${r.id} posted.${r.ends_at ? ` It closes ${fmtTime(r.ends_at)}.` : ""}`,
+      (r) => {
+        if (r.scheduled) return `Poll #${r.id} is scheduled. It posts ${fmtTime(r.send_at)}.`;
+        return `Poll #${r.id} posted.${r.ends_at ? ` It closes ${fmtTime(r.ends_at)}.` : ""}`;
+      },
       async () => { form.reset(); fillSelects(); await loadPolls(); },
     );
   });
@@ -753,6 +761,12 @@
   async function loadPolls() {
     const rows = await api(`guilds/${state.guildId}/polls`);
     renderList($("#poll-list"), rows, pollRow, "No polls yet.");
+  }
+
+  function pollTiming(row) {
+    if (row.status === "scheduled" && row.send_at) return ` · posts ${fmtTime(row.send_at)}`;
+    if (row.status === "open" && row.ends_at) return ` · closes ${fmtTime(row.ends_at)}`;
+    return "";
   }
 
   function pollRow(row) {
@@ -766,19 +780,23 @@
         el("strong", { text: `#${row.id} · ${row.question}` }),
         el("div", {
           class: "meta",
-          text: `${row.status}${row.ends_at && row.status === "open" ? ` · closes ${fmtTime(row.ends_at)}` : ""} · ${channelName(row.channel_id)}`,
+          text: `${row.status}${pollTiming(row)} · ${channelName(row.channel_id)}`,
         }),
         el("div", { class: "body", text: detail }),
       ]),
     ];
-    if (row.status === "open") {
-      const button = el("button", { type: "button", class: "small", text: "Close now" });
-      button.addEventListener("click", () => runAction(
-        button,
-        () => api(`guilds/${state.guildId}/polls/${row.id}/close`, { method: "POST" }),
-        (r) => `Closed poll #${r.id}: ${r.question}`,
-        loadPolls,
-      ));
+    if (row.status === "open" || row.status === "scheduled") {
+      const scheduled = row.status === "scheduled";
+      const button = el("button", { type: "button", class: "small", text: scheduled ? "Cancel" : "Close now" });
+      button.addEventListener("click", () => {
+        if (scheduled && !window.confirm(`Cancel poll #${row.id}? It will not be posted.`)) return;
+        runAction(
+          button,
+          () => api(`guilds/${state.guildId}/polls/${row.id}/close`, { method: "POST" }),
+          (r) => (r.cancelled ? `Cancelled scheduled poll #${r.id}.` : `Closed poll #${r.id}: ${r.question}`),
+          loadPolls,
+        );
+      });
       children.push(button);
     }
     const resultsButton = el("button", { type: "button", class: "ghost small", text: "Results" });
@@ -880,8 +898,34 @@
   });
 
   async function loadTickets() {
-    const rows = await api(`guilds/${state.guildId}/tickets?open=1`);
-    renderList($("#ticket-list"), rows, ticketRow, "No open tickets.");
+    const [open, all] = await Promise.all([
+      api(`guilds/${state.guildId}/tickets?open=1`),
+      api(`guilds/${state.guildId}/tickets`),
+    ]);
+    renderList($("#ticket-list"), open, ticketRow, "No open tickets.");
+    const closed = (all || []).filter((row) => row.status === "closed");
+    renderList($("#ticket-closed-list"), closed, closedTicketRow, "No closed tickets yet.");
+  }
+
+  function closedTicketRow(row) {
+    const meta = `opened by ${row.opener_name || "a member"}${row.closed_at ? ` · closed ${fmtTime(row.closed_at)}` : ""}`;
+    const children = [
+      el("div", { class: "grow" }, [
+        el("strong", { text: `Ticket #${row.id}` }),
+        el("div", { class: "meta", text: meta }),
+      ]),
+    ];
+    if (row.has_transcript) {
+      children.push(el("a", {
+        class: "button-link small",
+        text: "Download transcript",
+        href: `api/guilds/${state.guildId}/tickets/${row.id}/transcript`,
+        download: `ticket-${row.id}.txt`,
+      }));
+    } else {
+      children.push(el("span", { class: "muted", text: "No transcript saved" }));
+    }
+    return el("li", {}, children);
   }
 
   function ticketRow(row) {
@@ -958,6 +1002,115 @@
         el("div", { class: "meta", text: `message ${row.message_id} · ${channelName(row.channel_id)}` }),
       ]),
       remove,
+    ]);
+  }
+
+  // ------------------------------------------------------------------ //
+  // Role menus: one message with a dropdown that gives and takes roles
+  // ------------------------------------------------------------------ //
+  $("#menu-form").addEventListener("submit", (event) => {
+    event.preventDefault();
+    const form = event.currentTarget;
+    const f = new FormData(form);
+    submitForm(
+      form,
+      () => api(`guilds/${state.guildId}/role-menus`, {
+        method: "POST",
+        body: { title: f.get("title"), description: opt(f, "description") },
+      }),
+      (r) => `Role menu #${r.id} is ready. Add roles, then post it.`,
+      async () => { form.reset(); await loadRoleMenus(); },
+    );
+  });
+
+  async function loadRoleMenus() {
+    const rows = await api(`guilds/${state.guildId}/role-menus`);
+    renderList($("#menu-list"), rows, roleMenuRow, "No role menus yet.");
+  }
+
+  // Selects for a menu row are built from the snapshot, like fillSelects does.
+  function menuSelect(kind) {
+    const snapshot = state.snapshot || { roles: [], channels: [] };
+    const select = el("select", { class: kind === "role" ? "role-select" : "channel-select" });
+    if (kind === "role") {
+      select.append(el("option", { value: "", text: "Choose a role" }));
+      for (const role of snapshot.roles) select.append(el("option", { value: role.id, text: `@${role.name}` }));
+    } else {
+      select.append(el("option", { value: "", text: "Server default" }));
+      for (const channel of snapshot.channels) {
+        select.append(el("option", { value: channel.id, text: `#${channel.name}` }));
+      }
+    }
+    return select;
+  }
+
+  function roleMenuRow(menu) {
+    const options = menu.options || [];
+    const posted = menu.message_id ? `posted in ${channelName(menu.channel_id)}` : "not posted yet";
+    const optionRows = options.map((option) => {
+      const remove = el("button", { type: "button", class: "ghost small", text: "Remove" });
+      remove.addEventListener("click", () => runAction(
+        remove,
+        () => api(`guilds/${state.guildId}/role-menus/${menu.id}/options/${option.role_id}`, { method: "DELETE" }),
+        `Removed ${option.label} from the menu.`,
+        loadRoleMenus,
+      ));
+      return el("div", { class: "menu-option" }, [
+        el("span", { class: "grow", text: `${option.label} gives ${roleName(option.role_id)}` }),
+        remove,
+      ]);
+    });
+
+    const roleSelect = menuSelect("role");
+    const labelInput = el("input", { name: "label", maxlength: "100", placeholder: "Label (optional)" });
+    const addRole = el("button", { type: "button", class: "small", text: "Add role" });
+    addRole.addEventListener("click", () => {
+      if (!roleSelect.value) return notice("Choose a role first.", "err");
+      const body = { role_id: roleSelect.value };
+      if (labelInput.value.trim()) body.label = labelInput.value.trim();
+      runAction(
+        addRole,
+        () => api(`guilds/${state.guildId}/role-menus/${menu.id}/options`, { method: "POST", body }),
+        "Role added to the menu.",
+        loadRoleMenus,
+      );
+    });
+
+    const channelSelect = menuSelect("channel");
+    const post = el("button", { type: "button", class: "small", text: menu.message_id ? "Post again" : "Post menu" });
+    post.addEventListener("click", () => {
+      if (options.length === 0) return notice("Add at least one role before posting.", "err");
+      runAction(
+        post,
+        () => api(`guilds/${state.guildId}/role-menus/${menu.id}/post`, {
+          method: "POST",
+          body: { channel_id: channelSelect.value || null },
+        }),
+        (r) => `Menu posted in ${channelName(r.channel_id)}. Members can pick roles from it.`,
+        loadRoleMenus,
+      );
+    });
+
+    const remove = el("button", { type: "button", class: "danger small", text: "Delete menu" });
+    remove.addEventListener("click", () => {
+      if (!window.confirm(`Delete role menu #${menu.id}? Its message is removed. Roles members already have are kept.`)) return;
+      runAction(
+        remove,
+        () => api(`guilds/${state.guildId}/role-menus/${menu.id}`, { method: "DELETE" }),
+        "Deleted the role menu.",
+        loadRoleMenus,
+      );
+    });
+
+    return el("li", { class: "menu-row" }, [
+      el("div", { class: "grow" }, [
+        el("strong", { text: `#${menu.id} · ${menu.title}` }),
+        el("div", { class: "meta", text: `${options.length} role${options.length === 1 ? "" : "s"} · ${posted}` }),
+        menu.description ? el("div", { class: "body", text: menu.description }) : null,
+        ...(optionRows.length ? optionRows : [el("div", { class: "muted", text: "No roles yet." })]),
+        el("div", { class: "actions" }, [roleSelect, labelInput, addRole]),
+        el("div", { class: "actions" }, [channelSelect, post, remove]),
+      ]),
     ]);
   }
 
@@ -1068,6 +1221,7 @@
           quiet_end: opt(f, "quiet_end"),
           quiet_hold_manual: f.has("quiet_hold_manual"),
           ticket_category_id: opt(f, "ticket_category_id"),
+          ticket_auto_close_days: opt(f, "ticket_auto_close_days") ?? "0",
         },
       }),
       "Settings saved.",

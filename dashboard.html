@@ -46,7 +46,7 @@
         <button type="button" data-tab="templates">Templates</button>
         <button type="button" data-tab="polls">Polls</button>
         <button type="button" data-tab="tickets">Tickets</button>
-        <button type="button" data-tab="roles">Reaction roles</button>
+        <button type="button" data-tab="roles">Roles</button>
         <button type="button" data-tab="events">Events</button>
         <button type="button" data-tab="welcome">Welcome</button>
         <button type="button" data-tab="settings">Settings</button>
@@ -188,6 +188,9 @@
           <label>Close after (optional)
             <input name="duration" placeholder="2h, 3d">
           </label>
+          <label>Post at (optional)
+            <input name="send_at" placeholder="2h, or 2026-10-24 18:00">
+          </label>
           <label>Channel
             <select name="channel_id" class="channel-select"></select>
           </label>
@@ -214,15 +217,18 @@
             <select name="channel_id" class="channel-select"></select>
           </label>
           <div class="actions"><button type="submit">Post button</button></div>
-          <p class="span2 muted">Each member can have one open ticket at a time. Opening one creates a private channel for them and the staff role. Closing it deletes the channel; there is no transcript. Set the category new channels go in under Settings.</p>
+          <p class="span2 muted">Each member can have one open ticket at a time. Opening one creates a private channel for them and the staff role. Closing it saves the conversation as a transcript you can download below, then deletes the channel. Set the category new channels go in under Settings, and an idle-close limit there if you want quiet tickets closed for you.</p>
         </form>
         <h3>Open tickets</h3>
         <ul id="ticket-list" class="list"></ul>
+        <h3>Closed tickets</h3>
+        <ul id="ticket-closed-list" class="list"></ul>
       </section>
 
-      <!-- Reaction roles -->
+      <!-- Roles: reaction roles and role menus -->
       <section class="panel" data-panel="roles" hidden>
-        <h2>Reaction roles</h2>
+        <h2>Roles</h2>
+        <h3>Reaction roles</h3>
         <form id="role-form" class="grid">
           <label class="span2">Message link, or its ID
             <input name="message" required placeholder="Right-click the message, Copy Message Link">
@@ -241,6 +247,18 @@
         </form>
         <h3>Current rules</h3>
         <ul id="role-list" class="list"></ul>
+        <h3>Role menus</h3>
+        <p class="muted">A role menu is one message with a dropdown. Members pick the roles they want from it. Roles they leave unticked are taken away, so a menu can also remove a role.</p>
+        <form id="menu-form" class="grid">
+          <label>Title
+            <input name="title" maxlength="256" required placeholder="Pick your games">
+          </label>
+          <label class="span2">Text above the roles (optional)
+            <textarea name="description" rows="2" maxlength="1000"></textarea>
+          </label>
+          <div class="actions span2"><button type="submit">Create menu</button></div>
+        </form>
+        <ul id="menu-list" class="list"></ul>
       </section>
 
       <!-- Events -->
@@ -314,6 +332,9 @@
           <label class="check span2"><input type="checkbox" name="quiet_hold_manual"> Also hold posts made by hand until quiet hours end</label>
           <label>Ticket category
             <select name="ticket_category_id" class="category-select"></select>
+          </label>
+          <label>Close idle tickets after (days, 0 means never)
+            <input name="ticket_auto_close_days" type="number" min="0" max="365" step="1" value="0">
           </label>
           <p class="span2 muted">Quiet hours hold scheduled and repeating posts until the window ends. Use 24-hour times in the server's timezone. Leave both empty to turn them off.</p>
           <p class="span2 muted">Staff role: once set, only its holders (and administrators) can use staff tools. Leave it empty to fall back to Manage Server.</p>

@@ -1,4 +1,4 @@
-"""Buttons that keep working after a restart: poll votes and ticket open/close.
+"""Buttons and dropdowns that keep working after a restart: poll votes, ticket open/close, role menus.
 
 Each button is a ``discord.ui.DynamicItem``. Discord only sends the custom id
 of a pressed button, and the bot finds the matching class by a regular
@@ -19,6 +19,7 @@ import discord
 
 import operations as ops
 import polls
+import role_menus
 import settings
 import tickets
 from audit import Actor
@@ -120,6 +121,38 @@ async def handle_ticket_close(interaction: discord.Interaction) -> None:
     await _reply(interaction, f"Ticket #{ticket['id']} is closed.")
 
 
+async def handle_role_menu(interaction: discord.Interaction, menu_id: int, picked: list[str]) -> None:
+    if interaction.guild_id is None:
+        await _reply(interaction, "Role menus only work inside a server.")
+        return
+    bot = _bot(interaction)
+    held = [role.id for role in getattr(interaction.user, "roles", [])]
+    try:
+        added, removed = await ops.apply_role_menu(
+            bot.gateway,
+            interaction.guild_id,
+            interaction.user.id,
+            held,
+            menu_id,
+            [int(value) for value in picked if str(value).isdigit()],
+        )
+    except OperationError as exc:
+        await _reply(interaction, str(exc))
+        return
+    guild = interaction.guild
+
+    def name(role_id: int) -> str:
+        role = guild.get_role(role_id) if guild is not None else None
+        return f"@{role.name}" if role is not None else f"role {role_id}"
+
+    parts = []
+    if added:
+        parts.append("Added " + ", ".join(name(r) for r in added))
+    if removed:
+        parts.append("Removed " + ", ".join(name(r) for r in removed))
+    await _reply(interaction, ". ".join(parts) + "." if parts else "No change: your roles already match your choice.")
+
+
 # --------------------------------------------------------------------------- #
 # Dynamic items
 # --------------------------------------------------------------------------- #
@@ -170,7 +203,37 @@ class TicketCloseButton(discord.ui.DynamicItem[discord.ui.Button], template=r"cm
         await handle_ticket_close(interaction)
 
 
-DYNAMIC_ITEMS = (PollButton, TicketOpenButton, TicketCloseButton)
+class RoleMenuSelect(discord.ui.DynamicItem[discord.ui.Select], template=r"cm:rolemenu:(?P<mid>\d+)$"):
+    def __init__(
+        self,
+        menu_id: int,
+        placeholder: str = role_menus.PLACEHOLDER,
+        options: Optional[list[dict[str, Any]]] = None,
+        max_values: int = 1,
+    ) -> None:
+        self.menu_id = int(menu_id)
+        select = discord.ui.Select(
+            custom_id=role_menus.custom_id(menu_id),
+            placeholder=placeholder,
+            min_values=0,
+            max_values=max(1, max_values),
+            options=[
+                discord.SelectOption(label=o["label"], value=o["value"], description=o.get("description"))
+                for o in options or []
+            ],
+        )
+        super().__init__(select)
+
+    @classmethod
+    async def from_custom_id(cls, interaction: discord.Interaction, item: discord.ui.Item, match) -> "RoleMenuSelect":
+        return cls(int(match["mid"]))
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        picked = [str(v) for v in (interaction.data or {}).get("values", [])]
+        await handle_role_menu(interaction, self.menu_id, picked)
+
+
+DYNAMIC_ITEMS = (PollButton, TicketOpenButton, TicketCloseButton, RoleMenuSelect)
 
 
 def build_view(buttons: list[dict[str, Any]]) -> discord.ui.View:
@@ -180,6 +243,17 @@ def build_view(buttons: list[dict[str, Any]]) -> discord.ui.View:
     """
     view = discord.ui.View(timeout=None)
     for spec in buttons:
+        if spec.get("kind") == "select":
+            menu_id = int(spec["custom_id"].rsplit(":", 1)[1])
+            view.add_item(
+                RoleMenuSelect(
+                    menu_id,
+                    placeholder=spec.get("placeholder") or role_menus.PLACEHOLDER,
+                    options=spec.get("options") or [],
+                    max_values=int(spec.get("max") or 1),
+                )
+            )
+            continue
         custom_id = spec["custom_id"]
         label = spec.get("label") or ""
         emoji = spec.get("emoji")

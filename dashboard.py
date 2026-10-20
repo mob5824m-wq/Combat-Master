@@ -188,6 +188,13 @@ class DashboardServer:
         r.add_get(f"{g}/tickets", self._tickets_list)
         r.add_post(f"{g}/tickets/panel", self._ticket_panel)
         r.add_post(f"{g}/tickets/{{tid}}/close", self._ticket_close)
+        r.add_get(f"{g}/tickets/{{tid}}/transcript", self._ticket_transcript)
+        r.add_get(f"{g}/role-menus", self._role_menus_list)
+        r.add_post(f"{g}/role-menus", self._role_menu_create)
+        r.add_delete(f"{g}/role-menus/{{mid}}", self._role_menu_delete)
+        r.add_post(f"{g}/role-menus/{{mid}}/options", self._role_menu_option_add)
+        r.add_delete(f"{g}/role-menus/{{mid}}/options/{{rid}}", self._role_menu_option_remove)
+        r.add_post(f"{g}/role-menus/{{mid}}/post", self._role_menu_post)
         r.add_get(f"{g}/reaction-roles", self._reaction_roles_list)
         r.add_post(f"{g}/reaction-roles", self._reaction_role_add)
         r.add_delete(f"{g}/reaction-roles/{{rid}}", self._reaction_role_remove)
@@ -436,6 +443,7 @@ class DashboardServer:
             "quiet_end": cfg["quiet_end"],
             "quiet_hold_manual": cfg["quiet_hold_manual"],
             "ticket_category_id": cfg["ticket_category_id"],
+            "ticket_auto_close_days": cfg["ticket_auto_close_days"],
             "default_welcome_message": welcome.DEFAULT_WELCOME_MESSAGE,
             "placeholders": list(welcome.PLACEHOLDERS),
         }
@@ -585,6 +593,7 @@ class DashboardServer:
             channel_id=_as_int(body.get("channel_id"), "channel_id"),
             duration=body.get("duration") or None,
             multiple=_as_bool(body.get("multiple")),
+            send_at=body.get("send_at") or None,
         )
         return self._json(result, status=201)
 
@@ -648,6 +657,87 @@ class DashboardServer:
             message=str(body.get("message") or ""),
             emoji=str(body.get("emoji") or ""),
             role_id=_as_int(body.get("role_id"), "role_id"),
+            channel_id=_as_int(body.get("channel_id"), "channel_id"),
+        )
+        return self._json(result, status=201)
+
+    async def _ticket_transcript(self, request: web.Request) -> web.Response:
+        self._authed(request)
+        guild = await self._guild(request)
+        tid = _as_int(request.match_info["tid"], "id")
+        row = ops.get_ticket_transcript(guild["id"], tid)
+        return web.Response(
+            text=row["text"],
+            content_type="text/plain",
+            charset="utf-8",
+            headers={"Content-Disposition": f'attachment; filename="ticket-{tid}.txt"'},
+        )
+
+    async def _role_menus_list(self, request: web.Request) -> web.Response:
+        self._authed(request)
+        guild = await self._guild(request)
+        return self._json(ops.list_role_menus(guild["id"]))
+
+    async def _role_menu_create(self, request: web.Request) -> web.Response:
+        self._authed(request)
+        guild = await self._guild(request)
+        body = await self._body(request)
+        result = await ops.create_role_menu(
+            self.gateway,
+            self.config,
+            guild["id"],
+            DASHBOARD_ACTOR,
+            title=str(body.get("title") or ""),
+            description=str(body.get("description") or ""),
+        )
+        return self._json(result, status=201)
+
+    async def _role_menu_delete(self, request: web.Request) -> web.Response:
+        self._authed(request)
+        guild = await self._guild(request)
+        mid = _as_int(request.match_info["mid"], "id")
+        result = await ops.delete_role_menu(self.gateway, self.config, guild["id"], DASHBOARD_ACTOR, menu_id=mid)
+        return self._json(result)
+
+    async def _role_menu_option_add(self, request: web.Request) -> web.Response:
+        self._authed(request)
+        guild = await self._guild(request)
+        body = await self._body(request)
+        result = await ops.add_role_menu_option(
+            self.gateway,
+            self.config,
+            guild["id"],
+            DASHBOARD_ACTOR,
+            menu_id=_as_int(request.match_info["mid"], "id"),
+            role_id=_as_int(body.get("role_id"), "role_id"),
+            label=body.get("label") or None,
+            description=body.get("description") or None,
+        )
+        return self._json(result, status=201)
+
+    async def _role_menu_option_remove(self, request: web.Request) -> web.Response:
+        self._authed(request)
+        guild = await self._guild(request)
+        result = await ops.remove_role_menu_option(
+            self.gateway,
+            self.config,
+            guild["id"],
+            DASHBOARD_ACTOR,
+            menu_id=_as_int(request.match_info["mid"], "id"),
+            role_id=_as_int(request.match_info["rid"], "id"),
+        )
+        return self._json(result)
+
+    async def _role_menu_post(self, request: web.Request) -> web.Response:
+        self._authed(request)
+        guild = await self._guild(request)
+        body = await self._body(request)
+        result = await ops.post_role_menu(
+            self.gateway,
+            self.config,
+            guild["id"],
+            DASHBOARD_ACTOR,
+            menu_id=_as_int(request.match_info["mid"], "id"),
             channel_id=_as_int(body.get("channel_id"), "channel_id"),
         )
         return self._json(result, status=201)

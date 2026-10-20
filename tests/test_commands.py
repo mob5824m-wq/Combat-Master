@@ -129,6 +129,11 @@ class CommandTreeTests(unittest.TestCase):
             for param in command.parameters:
                 self.assertLessEqual(len(param.description), 100, f"{command.qualified_name}.{param.name}")
 
+    def test_slash_command_count_is_what_the_readme_lists(self):
+        # Update this number and the README command list together when a command is added.
+        ensure_cog_registered()
+        self.assertEqual(len(list(leaves(command_tree.manage_group))), 42)
+
     def test_payload_serialises_to_json(self):
         ensure_cog_registered()
         payload = command_tree.manage_group.to_dict(bot_module.bot.tree)
@@ -141,8 +146,9 @@ class CommandTreeTests(unittest.TestCase):
             set(top),
             {"announce", "schedule", "repeat", "scheduled", "cancel", "history", "template",
              "poll", "event", "welcome", "status", "audit", "setup", "fixcommands",
-             "queue", "approve", "reject", "edit", "delete", "quiet", "pins", "ticket", "reactionrole"},
+             "queue", "approve", "reject", "edit", "delete", "quiet", "pins", "ticket", "reactionrole", "rolemenu"},
         )
+        self.assertEqual({c.name for c in top["rolemenu"].commands}, {"new", "add", "remove", "post", "list", "delete"})
         self.assertEqual({c.name for c in top["template"].commands}, {"save", "list", "delete", "use"})
         self.assertEqual({c.name for c in top["poll"].commands}, {"create", "list", "close"})
         self.assertEqual({c.name for c in top["ticket"].commands}, {"panel", "list", "close"})

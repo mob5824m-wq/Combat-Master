@@ -93,6 +93,11 @@ class DemoGateway:
         self.role_changes: list[tuple[int, int, int, bool]] = []  # (guild, user, role, add)
         self.unassignable_roles: set[int] = set()  # tests set this to simulate a role above the bot
         self.fail_ticket_creation = False  # tests set this to simulate missing Manage Channels
+        # Transcripts, files and menus. say() simulates someone writing in a channel.
+        self.history: dict[int, list[dict[str, Any]]] = {}
+        self.files: list[dict[str, Any]] = []
+        self.edits: list[dict[str, Any]] = []
+        self.unreadable: set[int] = set()  # tests set this to simulate a channel that can not be read
 
     # ---- lookups ------------------------------------------------------ #
     def _find(self, guild_id: int) -> Optional[dict[str, Any]]:
@@ -274,6 +279,53 @@ class DemoGateway:
         if (int(channel_id), int(message_id)) not in self.messages:
             raise OperationError("Could not find that message on Discord.")
 
+    def say(
+        self,
+        channel_id: int,
+        author: str,
+        text: str,
+        *,
+        bot: bool = False,
+        attachments: tuple[str, ...] = (),
+        when: Optional[datetime] = None,
+    ) -> None:
+        """Simulate someone writing in a channel, so transcripts have something to read."""
+        self.history.setdefault(int(channel_id), []).append(
+            {
+                "author": author,
+                "author_id": 0,
+                "bot": bot,
+                "created_at": when or datetime.now(timezone.utc),
+                "content": text,
+                "attachments": list(attachments),
+            }
+        )
+
+    async def read_history(self, guild_id: int, channel_id: int, limit: int) -> list[dict[str, Any]]:
+        if int(channel_id) in self.unreadable or int(channel_id) not in self._channel_index:
+            raise OperationError("That channel is no longer available.")
+        return [dict(m) for m in self.history.get(int(channel_id), [])][: int(limit)]
+
+    async def post_file(self, guild_id: int, channel_id: int, *, content: str, filename: str, data: bytes) -> None:
+        self._check(guild_id, channel_id)
+        self.files.append({"channel_id": int(channel_id), "content": content, "filename": filename, "data": data})
+
+    async def edit_message(
+        self,
+        guild_id: int,
+        channel_id: int,
+        message_id: int,
+        *,
+        embed: Optional[discord.Embed] = None,
+        view: Optional[list[dict[str, Any]]] = None,
+    ) -> None:
+        key = (int(channel_id), int(message_id))
+        if key not in self.messages:
+            raise OperationError("Could not find that message on Discord.")
+        self.messages[key]["embed"] = embed
+        self.messages[key]["view"] = list(view) if view else None
+        self.edits.append({"channel_id": int(channel_id), "message_id": int(message_id), "view": view})
+
     async def delete_message(self, guild_id: int, channel_id: int, message_id: int) -> None:
         key = (int(channel_id), int(message_id))
         if key in self.messages:  # a message that is already gone counts as deleted
@@ -343,6 +395,51 @@ async def seed_demo(gateway: DemoGateway, cfg: dict[str, Any]) -> None:
         member = Actor(DEMO_MEMBER_IDS[offset + 1], f"Member {offset + 1}", "discord")
         for index in choices:
             await ops.cast_vote(gateway, cfg, guild_id, poll["id"], member, index)
+
+    # A poll that is scheduled for tomorrow, so the scheduled state shows.
+    await ops.create_poll(
+        gateway,
+        cfg,
+        guild_id,
+        staff,
+        question="Pizza or tacos on Friday?",
+        options=["Pizza", "Tacos"],
+        channel_id=100000000000000104,
+        send_at="1d",
+    )
+
+    # A role menu, posted in general.
+    menu = await ops.create_role_menu(
+        gateway,
+        cfg,
+        guild_id,
+        staff,
+        title="Pick your roles",
+        description="Choose the roles you want. Pick none to remove them all.",
+    )
+    await ops.add_role_menu_option(
+        gateway, cfg, guild_id, staff, menu_id=menu["id"], role_id=100000000000000202, label="Member"
+    )
+    await ops.add_role_menu_option(
+        gateway,
+        cfg,
+        guild_id,
+        staff,
+        menu_id=menu["id"],
+        role_id=100000000000000203,
+        label="Event pings",
+        description="Get pinged when an event is posted",
+    )
+    await ops.post_role_menu(gateway, cfg, guild_id, staff, menu_id=menu["id"], channel_id=100000000000000102)
+
+    # A ticket that was closed, so its transcript is saved and can be downloaded.
+    member = Actor(DEMO_MEMBER_IDS[2], "Member 3", "discord")
+    ticket = await ops.open_ticket(gateway, cfg, guild_id, member)
+    channel = int(ticket["channel_id"])
+    gateway.say(channel, "Member 3", "Hi, the event pings role did not come through from the menu.")
+    gateway.say(channel, "Demo staff", "Thanks for the report. Which menu did you use?")
+    gateway.say(channel, "Member 3", "The Pick your roles menu in general.")
+    await ops.close_ticket(gateway, cfg, guild_id, staff, int(ticket["id"]), actor_is_staff=True)
 
 
 async def run_demo(host: str = "127.0.0.1", port: int = 8765) -> None:

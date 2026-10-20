@@ -60,6 +60,7 @@ import events
 import operations as ops
 import paths
 import polls
+import role_menus
 import settings
 import store
 import welcome
@@ -100,6 +101,9 @@ def _attach_file_log() -> None:
 # it must also be switched on in the Developer Portal.
 intents = discord.Intents.default()
 intents.members = True
+# Ticket transcripts keep what members write, so the bot must read message text.
+# This is a privileged intent: it must also be switched on in the Developer Portal.
+intents.message_content = True
 
 
 class CombatMasterBot(commands.Bot):
@@ -166,6 +170,16 @@ class CombatMasterBot(commands.Bot):
             server=guild.name,
             members=guild.member_count or 0,
         )
+
+    async def on_message(self, message: discord.Message) -> None:
+        # Activity in an open ticket resets its idle clock. The bot's own messages do not count.
+        # The bot has no prefix commands, so there is nothing else to pass this on to.
+        if message.guild is None or message.author.bot:
+            return
+        try:
+            ops.note_ticket_activity(message.channel.id)
+        except Exception:  # never let a bookkeeping failure reach the message pipeline
+            logger.exception("Could not record ticket activity.")
 
     async def on_raw_reaction_add(self, payload: discord.RawReactionActionEvent) -> None:
         if payload.member is not None and payload.member.bot:
@@ -299,6 +313,12 @@ ticket_group = app_commands.Group(
     parent=manage_group,
     guild_only=True,
 )
+role_menu_group = app_commands.Group(
+    name="rolemenu",
+    description="Dropdowns that let members pick their own roles.",
+    parent=manage_group,
+    guild_only=True,
+)
 reaction_role_group = app_commands.Group(
     name="reactionrole",
     description="Give or take a role when someone reacts to a message.",
@@ -334,6 +354,7 @@ class CombatMasterCog(commands.Cog):
     poll_group = poll_group
     ticket_group = ticket_group
     reaction_role_group = reaction_role_group
+    role_menu_group = role_menu_group
     event_group = event_group
     welcome_group = welcome_group
 
@@ -647,6 +668,7 @@ class CombatMasterCog(commands.Cog):
         duration="Optional: how long it stays open, e.g. 2h or 3d. Otherwise close it by hand.",
         channel="Where to post. Defaults to the server's announcement channel.",
         multiple="Let members pick more than one option. Off means one pick each.",
+        send_at="Optional: post later, e.g. 2h or 2026-10-24 18:00 (server time). Otherwise post now.",
     )
     async def poll_create(
         self,
@@ -656,6 +678,7 @@ class CombatMasterCog(commands.Cog):
         duration: Optional[app_commands.Range[str, 1, 20]] = None,
         channel: Optional[discord.TextChannel] = None,
         multiple: bool = False,
+        send_at: Optional[app_commands.Range[str, 1, 40]] = None,
     ) -> None:
         if not await self._staff(interaction):
             return
@@ -670,9 +693,17 @@ class CombatMasterCog(commands.Cog):
                 channel_id=channel.id if channel else None,
                 duration=duration,
                 multiple=multiple,
+                send_at=send_at,
             )
         except OperationError as exc:
             await self._reply(interaction, str(exc))
+            return
+        if result["scheduled"]:
+            await self._reply(
+                interaction,
+                f"Poll **#{result['id']}** is scheduled for {_when_text(result['send_at'])} in <#{result['channel_id']}>. "
+                "Cancel it before then with `/manage poll close`.",
+            )
             return
         closes = f" It closes {_when_text(result['ends_at'])}." if result["ends_at"] else " Close it with `/manage poll close`."
         choice = " Members can pick several options." if result["multiple"] else ""
@@ -823,7 +854,148 @@ class CombatMasterCog(commands.Cog):
             return
         await self._reply(interaction, f"Removed reaction role **#{rule_id}**.")
 
-    @poll_group.command(name="close", description="Close a poll now and post its results.")
+    # ================================================================== #
+    # Role menus
+    # ================================================================== #
+    @role_menu_group.command(name="new", description="Start a role menu, then add roles and post it.")
+    @app_commands.describe(
+        title="The heading members see above the menu.",
+        description="Optional text shown above the list of roles.",
+    )
+    async def rolemenu_new(
+        self,
+        interaction: discord.Interaction,
+        title: app_commands.Range[str, 1, role_menus.MAX_TITLE_LENGTH],
+        description: Optional[app_commands.Range[str, 1, role_menus.MAX_DESCRIPTION_LENGTH]] = None,
+    ) -> None:
+        if not await self._staff(interaction):
+            return
+        try:
+            result = await ops.create_role_menu(
+                self.bot.gateway,
+                self.bot.config,
+                interaction.guild_id,
+                _actor(interaction),
+                title=title,
+                description=description or "",
+            )
+        except OperationError as exc:
+            await self._reply(interaction, str(exc))
+            return
+        await self._reply(
+            interaction,
+            f"Role menu **#{result['id']}** is ready. Add roles with `/manage rolemenu add`, "
+            "then post it with `/manage rolemenu post`.",
+        )
+
+    @role_menu_group.command(name="add", description="Add a role that members can pick from a menu.")
+    @app_commands.describe(
+        menu_id="The number of the menu, from /manage rolemenu list.",
+        role="The role members can pick. My role must be above it.",
+        label="Optional name shown in the menu. Defaults to the role's name.",
+        description="Optional short note shown beside the role.",
+    )
+    async def rolemenu_add(
+        self,
+        interaction: discord.Interaction,
+        menu_id: app_commands.Range[int, 1, 2_000_000_000],
+        role: discord.Role,
+        label: Optional[app_commands.Range[str, 1, role_menus.MAX_LABEL_LENGTH]] = None,
+        description: Optional[app_commands.Range[str, 1, role_menus.MAX_OPTION_DESCRIPTION_LENGTH]] = None,
+    ) -> None:
+        if not await self._staff(interaction):
+            return
+        try:
+            result = await ops.add_role_menu_option(
+                self.bot.gateway,
+                self.bot.config,
+                interaction.guild_id,
+                _actor(interaction),
+                menu_id=menu_id,
+                role_id=role.id,
+                label=label,
+                description=description,
+            )
+        except OperationError as exc:
+            await self._reply(interaction, str(exc))
+            return
+        await self._reply(interaction, f"Added **{result['label']}** ({role.mention}) to menu **#{menu_id}**.")
+
+    @role_menu_group.command(name="remove", description="Take a role out of a menu.")
+    @app_commands.describe(menu_id="The number of the menu.", role="The role to take out.")
+    async def rolemenu_remove(
+        self,
+        interaction: discord.Interaction,
+        menu_id: app_commands.Range[int, 1, 2_000_000_000],
+        role: discord.Role,
+    ) -> None:
+        if not await self._staff(interaction):
+            return
+        try:
+            await ops.remove_role_menu_option(
+                self.bot.gateway, self.bot.config, interaction.guild_id, _actor(interaction), menu_id=menu_id, role_id=role.id
+            )
+        except OperationError as exc:
+            await self._reply(interaction, str(exc))
+            return
+        await self._reply(interaction, f"Removed {role.mention} from menu **#{menu_id}**.")
+
+    @role_menu_group.command(name="post", description="Post a role menu's dropdown in a channel.")
+    @app_commands.describe(
+        menu_id="The number of the menu.",
+        channel="Where to post. Defaults to the server's announcement channel.",
+    )
+    async def rolemenu_post(
+        self,
+        interaction: discord.Interaction,
+        menu_id: app_commands.Range[int, 1, 2_000_000_000],
+        channel: Optional[discord.TextChannel] = None,
+    ) -> None:
+        if not await self._staff(interaction):
+            return
+        try:
+            result = await ops.post_role_menu(
+                self.bot.gateway,
+                self.bot.config,
+                interaction.guild_id,
+                _actor(interaction),
+                menu_id=menu_id,
+                channel_id=channel.id if channel else None,
+            )
+        except OperationError as exc:
+            await self._reply(interaction, str(exc))
+            return
+        await self._reply(interaction, f"Menu **#{menu_id}** posted: {result['jump_url']}")
+
+    @role_menu_group.command(name="list", description="List the role menus.")
+    async def rolemenu_list(self, interaction: discord.Interaction) -> None:
+        if not await self._staff(interaction):
+            return
+        rows = ops.list_role_menus(interaction.guild_id)
+        if not rows:
+            await self._reply(interaction, "No role menus yet.")
+            return
+        lines = []
+        for row in rows[:25]:
+            where = f"posted in <#{row['channel_id']}>" if row["message_id"] else "not posted"
+            lines.append(f"**#{row['id']}** · {row['title']} · {len(row['options'])} role(s) · {where}")
+        await self._reply(interaction, "\n".join(lines))
+
+    @role_menu_group.command(name="delete", description="Delete a role menu and its message.")
+    @app_commands.describe(menu_id="The number of the menu.")
+    async def rolemenu_delete(
+        self, interaction: discord.Interaction, menu_id: app_commands.Range[int, 1, 2_000_000_000]
+    ) -> None:
+        if not await self._staff(interaction):
+            return
+        try:
+            await ops.delete_role_menu(self.bot.gateway, self.bot.config, interaction.guild_id, _actor(interaction), menu_id=menu_id)
+        except OperationError as exc:
+            await self._reply(interaction, str(exc))
+            return
+        await self._reply(interaction, f"Deleted role menu **#{menu_id}**.")
+
+    @poll_group.command(name="close", description="Close a poll now and post its results, or cancel a scheduled one.")
     @app_commands.describe(poll_id="The number shown by /manage poll list.")
     async def poll_close(self, interaction: discord.Interaction, poll_id: app_commands.Range[int, 1, 2_000_000_000]) -> None:
         if not await self._staff(interaction):
@@ -832,6 +1004,9 @@ class CombatMasterCog(commands.Cog):
             result = await ops.close_poll(self.bot.gateway, self.bot.config, interaction.guild_id, _actor(interaction), poll_id)
         except OperationError as exc:
             await self._reply(interaction, str(exc))
+            return
+        if result.get("cancelled"):
+            await self._reply(interaction, f"Cancelled the scheduled poll **#{result['id']}**: {result['question']}")
             return
         lines = [f"Closed poll **#{result['id']}**: {result['question']}"]
         for option, count in zip(result["options"], result["votes"]):

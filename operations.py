@@ -29,6 +29,7 @@ import pins
 import polls
 import quiet
 import reaction_roles
+import role_menus
 import settings
 import tickets
 import welcome
@@ -38,6 +39,7 @@ logger = logging.getLogger("combat_master.operations")
 
 POLL_MIN_DURATION = timedelta(minutes=1)
 POLL_MAX_DURATION = timedelta(days=30)
+MAX_AUTO_CLOSE_DAYS = 365
 
 
 class OperationError(Exception):
@@ -125,6 +127,23 @@ class Gateway(Protocol):
     async def delete_message(self, guild_id: int, channel_id: int, message_id: int) -> None:
         """Delete a message. A message that is already gone counts as deleted."""
 
+    async def edit_message(
+        self,
+        guild_id: int,
+        channel_id: int,
+        message_id: int,
+        *,
+        embed: discord.Embed,
+        view: Optional[list[dict[str, Any]]] = None,
+    ) -> None:
+        """Replace a message's embed and buttons or dropdowns. ``view=None`` removes them."""
+
+    async def read_history(self, guild_id: int, channel_id: int, limit: int) -> list[dict[str, Any]]:
+        """The channel's messages, oldest first: ``{"author", "author_id", "bot", "created_at", "content", "attachments"}``."""
+
+    async def post_file(self, guild_id: int, channel_id: int, *, content: str, filename: str, data: bytes) -> None:
+        """Send a short message with one text file attached."""
+
     async def pin_message(self, guild_id: int, channel_id: int, message_id: int) -> None:
         ...
 
@@ -189,6 +208,17 @@ async def _log(gw: Gateway, cfg: dict, guild_id: int, embed: discord.Embed) -> N
         await gw.post(guild_id, channel_id, embed=embed)
     except Exception as exc:
         logger.warning("Could not write to the staff log in %s: %s", guild_id, exc)
+
+
+async def _log_file(gw: Gateway, cfg: dict, guild_id: int, *, content: str, filename: str, data: bytes) -> None:
+    """Attach a file to the staff log, e.g. a ticket transcript. Never raises, like ``_log``."""
+    channel_id = settings.get_staff_channel_id(cfg, guild_id)
+    if not channel_id:
+        return
+    try:
+        await gw.post_file(guild_id, channel_id, content=content, filename=filename, data=data)
+    except Exception as exc:
+        logger.warning("Could not write a file to the staff log in %s: %s", guild_id, exc)
 
 
 def _failure_embed(title: str, reason: str, channel_id: int, reference: str) -> discord.Embed:
@@ -738,6 +768,32 @@ async def use_template(
 # --------------------------------------------------------------------------- #
 # Polls
 # --------------------------------------------------------------------------- #
+async def _post_poll(
+    gw: Gateway,
+    guild_id: int,
+    poll_id: int,
+    channel_id: int,
+    question: str,
+    choices: list[str],
+    ends_at: Optional[datetime],
+    author_name: str,
+    multiple: bool,
+) -> int:
+    """Post a button poll and return its message id."""
+    embed = polls.build_poll_embed(
+        question=question,
+        options=choices,
+        votes=[0] * len(choices),
+        voters=0,
+        ends_at=ends_at,
+        author_name=author_name,
+        mode=polls.MODE_BUTTONS,
+        multiple=multiple,
+    )
+    sent = await gw.post(guild_id, channel_id, embed=embed, view=polls.button_specs(poll_id, choices))
+    return int(sent["message_id"])
+
+
 @_user_errors
 async def create_poll(
     gw: Gateway,
@@ -750,20 +806,54 @@ async def create_poll(
     channel_id: Optional[int] = None,
     duration: Optional[str] = None,
     multiple: bool = False,
+    send_at: Optional[str] = None,
     now: Optional[datetime] = None,
 ) -> dict[str, Any]:
+    """Post a poll now, or with ``send_at`` store it to be posted at that time.
+
+    A scheduled poll's close time is counted from when it is posted, so it runs
+    for its full duration.
+    """
     now = _now(now)
     text = polls.clean_question(question)
     choices = polls.parse_options(options)
-    ends_at = None
+    seconds = None
     if duration:
         seconds = ann.parse_duration(duration)
         if seconds is None:
             raise ValueError("I could not read that duration. Use something like `1h` or `2d`.")
-        ends_at = now + timedelta(seconds=seconds)
-        if ends_at - now < POLL_MIN_DURATION or ends_at - now > POLL_MAX_DURATION:
+        if timedelta(seconds=seconds) < POLL_MIN_DURATION or timedelta(seconds=seconds) > POLL_MAX_DURATION:
             raise ValueError("A poll must run between 1 minute and 30 days.")
+    when = None
+    if send_at:
+        when = ann.parse_send_time(send_at, now, settings.get_timezone_name(cfg, guild_id))
     target = _require_channel(gw, cfg, guild_id, channel_id)
+    if when is not None:
+        poll_id = polls.create_poll(
+            guild_id=guild_id,
+            channel_id=target,
+            author_id=actor.id,
+            question=text,
+            options=choices,
+            ends_at=None,
+            now=now,
+            mode=polls.MODE_BUTTONS,
+            multiple=bool(multiple),
+            send_at=when,
+            duration_seconds=seconds,
+        )
+        audit.record(guild_id, actor, "poll.schedule", f"#{poll_id}: {text} at {ann.iso_utc(when)}")
+        return {
+            "id": poll_id,
+            "channel_id": target,
+            "message_id": None,
+            "ends_at": None,
+            "send_at": ann.iso_utc(when),
+            "scheduled": True,
+            "options": choices,
+            "multiple": bool(multiple),
+        }
+    ends_at = now + timedelta(seconds=seconds) if seconds else None
     # The row is written first: the button ids contain the poll id.
     poll_id = polls.create_poll(
         guild_id=guild_id,
@@ -776,31 +866,49 @@ async def create_poll(
         mode=polls.MODE_BUTTONS,
         multiple=bool(multiple),
     )
-    embed = polls.build_poll_embed(
-        question=text,
-        options=choices,
-        votes=[0] * len(choices),
-        voters=0,
-        ends_at=ends_at,
-        author_name=actor.name,
-        mode=polls.MODE_BUTTONS,
-        multiple=bool(multiple),
-    )
     try:
-        sent = await gw.post(guild_id, target, embed=embed, view=polls.button_specs(poll_id, choices))
+        message_id = await _post_poll(
+            gw, guild_id, poll_id, target, text, choices, ends_at, actor.name, bool(multiple)
+        )
     except Exception:
         polls.delete_poll(poll_id)
         raise
-    polls.attach_message(poll_id, sent["message_id"])
+    polls.attach_message(poll_id, message_id)
     audit.record(guild_id, actor, "poll.create", f"#{poll_id}: {text}")
     return {
         "id": poll_id,
         "channel_id": target,
-        "message_id": str(sent["message_id"]),
+        "message_id": str(message_id),
         "ends_at": ann.iso_utc(ends_at) if ends_at else None,
+        "send_at": None,
+        "scheduled": False,
         "options": choices,
         "multiple": bool(multiple),
     }
+
+
+async def _post_scheduled_poll(gw: Gateway, cfg: dict, poll: dict[str, Any], now: datetime, counts: dict[str, int]) -> None:
+    """The scheduler's turn for a scheduled poll: post it, or mark it failed so it is not retried forever."""
+    guild_id = poll["guild_id"]
+    ends_at = now + timedelta(seconds=poll["duration_seconds"]) if poll["duration_seconds"] else None
+    try:
+        message_id = await _post_poll(
+            gw, guild_id, poll["id"], poll["channel_id"], poll["question"], poll["options"], ends_at, "", poll["multiple"]
+        )
+    except Exception as exc:
+        logger.warning("Could not post scheduled poll #%s: %s", poll["id"], exc)
+        polls.set_status(poll["id"], "failed", only_from="scheduled")
+        counts["failed"] += 1
+        await _log(
+            gw,
+            cfg,
+            guild_id,
+            _failure_embed("Scheduled poll not posted", str(exc), poll["channel_id"], f"poll #{poll['id']}"),
+        )
+        return
+    polls.activate(poll["id"], message_id, ends_at)
+    audit.record(guild_id, SCHEDULER_ACTOR, "poll.post", f"#{poll['id']}: {poll['question']}")
+    counts["polls_posted"] += 1
 
 
 @_user_errors
@@ -821,6 +929,8 @@ async def cast_vote(
         raise OperationError("That poll no longer exists.")
     if poll["mode"] != polls.MODE_BUTTONS:
         raise OperationError("This is an older poll. Vote by adding its reaction.")
+    if poll["status"] == "scheduled":
+        raise OperationError("That poll is not posted yet.")
     closes = ann.parse_stored(poll["ends_at"]) if poll["ends_at"] else None
     if poll["status"] != "open" or (closes is not None and closes <= now):
         raise OperationError(f"Poll #{poll['id']} is closed.")
@@ -911,6 +1021,11 @@ async def close_poll(gw: Gateway, cfg: dict, guild_id: int, actor: Actor, poll_i
     poll = polls.get_poll(guild_id, poll_id)
     if poll is None:
         raise OperationError(f"There is no poll #{poll_id} in this server.")
+    if poll["status"] == "scheduled":
+        # Not posted yet, so there is nothing to close: cancel it instead.
+        polls.set_status(poll_id, "cancelled", only_from="scheduled")
+        audit.record(guild_id, actor, "poll.cancel", f"#{poll_id}: {poll['question']}")
+        return {"id": poll_id, "question": poll["question"], "cancelled": True, "options": poll["options"], "votes": [], "voters": None}
     if poll["status"] != "open":
         raise OperationError(f"Poll #{poll_id} is already closed.")
     return await _finish_poll(gw, cfg, poll, actor, _now(now))
@@ -1022,21 +1137,84 @@ async def close_ticket(
         raise OperationError(f"Ticket #{ticket_id} is already closed.")
     if not actor_is_staff and int(actor.id) != int(ticket["opener_id"]):
         raise OperationError("Only the person who opened this ticket, or staff, can close it.")
+    # Read and keep the conversation before the channel goes. A failed read still lets the close go ahead.
+    text, count = await _read_transcript(gw, guild_id, ticket["channel_id"])
+    if text is not None:
+        tickets.save_transcript(guild_id, ticket_id, text, count, now)
     await gw.delete_channel(guild_id, ticket["channel_id"], reason=f"Ticket #{ticket_id} closed by {actor.name}")
     tickets.mark_closed(ticket_id, actor.name, now)
+    if text is not None:
+        saved = f"{count} message{'s' if count != 1 else ''} saved for staff."
+    else:
+        saved = "No transcript: the channel could not be read."
     embed = discord.Embed(
         title=f"Ticket #{ticket_id} closed",
-        description=f"Opened by {ticket['opener_name'] or 'a member'}, closed by {actor.name}.",
+        description=f"Opened by {ticket['opener_name'] or 'a member'}, closed by {actor.name}. {saved}",
         color=discord.Color.greyple(),
         timestamp=now,
     )
     await _log(gw, cfg, guild_id, embed)
+    if text is not None:
+        await _log_file(
+            gw,
+            cfg,
+            guild_id,
+            content=f"Transcript of ticket #{ticket_id} ({count} message{'s' if count != 1 else ''}).",
+            filename=f"ticket-{ticket_id}.txt",
+            data=text.encode("utf-8"),
+        )
     audit.record(guild_id, actor, "ticket.close", f"#{ticket_id}")
     return {"id": ticket_id, "channel_id": str(ticket["channel_id"]), "opener_name": ticket["opener_name"]}
 
 
+async def _read_transcript(gw: Gateway, guild_id: int, channel_id: int) -> tuple[Optional[str], int]:
+    """The ticket's conversation as text, and how many messages it has. ``(None, 0)`` if it can not be read."""
+    try:
+        messages = await gw.read_history(guild_id, channel_id, tickets.TRANSCRIPT_LIMIT)
+    except Exception as exc:
+        logger.warning("Could not read ticket channel %s for a transcript: %s", channel_id, exc)
+        return None, 0
+    return tickets.render_transcript(messages), len(messages)
+
+
+def note_ticket_activity(channel_id: int, *, now: Optional[datetime] = None) -> bool:
+    """Called for every message a member or staff member writes. Resets the idle clock of an open ticket."""
+    return tickets.touch(channel_id, _now(now))
+
+
+def get_ticket_transcript(guild_id: int, ticket_id: int) -> dict[str, Any]:
+    if tickets.get(guild_id, ticket_id) is None:
+        raise OperationError(f"There is no ticket #{ticket_id} in this server.")
+    row = tickets.get_transcript(guild_id, ticket_id)
+    if row is None:
+        raise OperationError(f"Ticket #{ticket_id} has no saved transcript.")
+    return row
+
+
+async def _close_idle_tickets(gw: Gateway, cfg: dict, now: datetime, counts: dict[str, int]) -> None:
+    """Close open tickets with no message for longer than the server's auto-close setting."""
+    for ticket in tickets.list_open_all():
+        guild_id = int(ticket["guild_id"])
+        days = settings.get_ticket_auto_close_days(cfg, guild_id)
+        if days <= 0 or tickets.last_activity(ticket) > now - timedelta(days=days):
+            continue
+        try:
+            await gw.post(guild_id, ticket["channel_id"], embed=tickets.idle_embed(days))
+        except Exception as exc:  # the close still goes ahead without the notice
+            logger.warning("Could not post the idle notice in ticket #%s: %s", ticket["id"], exc)
+        try:
+            await close_ticket(
+                gw, cfg, guild_id, SCHEDULER_ACTOR, int(ticket["id"]), actor_is_staff=True, now=now
+            )
+            counts["tickets_closed"] += 1
+        except Exception:
+            logger.exception("Could not close idle ticket #%s", ticket["id"])
+
+
 def list_tickets(guild_id: int, *, open_only: bool = False) -> list[dict[str, Any]]:
-    return tickets.list_tickets(guild_id, open_only=open_only)
+    rows = tickets.list_tickets(guild_id, open_only=open_only)
+    saved = tickets.transcript_ids(guild_id)
+    return [dict(row, has_transcript=int(row["id"]) in saved) for row in rows]
 
 
 # --------------------------------------------------------------------------- #
@@ -1127,6 +1305,169 @@ async def handle_reaction(
         logger.exception("Reaction role #%s failed for %s", rule["id"], user_id)
         return None
     return int(rule["role_id"])
+
+
+# --------------------------------------------------------------------------- #
+# Role menus: a dropdown that lets members pick their own roles
+# --------------------------------------------------------------------------- #
+def _menu_or_error(guild_id: int, menu_id: int) -> dict[str, Any]:
+    menu = role_menus.get(guild_id, menu_id)
+    if menu is None:
+        raise OperationError(f"There is no role menu #{menu_id} in this server.")
+    return menu
+
+
+def _role_name(gw: Gateway, guild_id: int, role_id: int) -> str:
+    snapshot = gw.snapshot(guild_id) or {}
+    for role in snapshot.get("roles", []):
+        if int(role["id"]) == int(role_id):
+            return role["name"]
+    return f"role {role_id}"
+
+
+async def _refresh_menu_message(gw: Gateway, guild_id: int, menu: dict[str, Any]) -> None:
+    """Bring the posted menu up to date with its roles. A message that can not be edited is logged, not fatal."""
+    if not menu["message_id"] or not menu["channel_id"]:
+        return
+    options = role_menus.options_for(menu["id"])
+    embed = role_menus.embed(menu["title"], menu["description"], options)
+    view = [role_menus.select_spec(menu["id"], options)] if options else None
+    try:
+        await gw.edit_message(guild_id, menu["channel_id"], menu["message_id"], embed=embed, view=view)
+    except Exception as exc:
+        logger.warning("Could not update role menu #%s: %s", menu["id"], exc)
+
+
+@_user_errors
+async def create_role_menu(
+    gw: Gateway,
+    cfg: dict,
+    guild_id: int,
+    actor: Actor,
+    *,
+    title: str,
+    description: str = "",
+    now: Optional[datetime] = None,
+) -> dict[str, Any]:
+    text = role_menus.clean_title(title)
+    body = role_menus.clean_text(description, role_menus.MAX_DESCRIPTION_LENGTH, "description")
+    menu_id = role_menus.create(guild_id, text, body, actor.id, _now(now))
+    audit.record(guild_id, actor, "rolemenu.create", f"#{menu_id}: {text}")
+    return {"id": menu_id, "title": text}
+
+
+@_user_errors
+async def add_role_menu_option(
+    gw: Gateway,
+    cfg: dict,
+    guild_id: int,
+    actor: Actor,
+    *,
+    menu_id: int,
+    role_id: int,
+    label: Optional[str] = None,
+    description: Optional[str] = None,
+) -> dict[str, Any]:
+    menu = _menu_or_error(guild_id, menu_id)
+    role_id = int(role_id)
+    problem = gw.role_problem(guild_id, role_id)
+    if problem:
+        raise OperationError(problem)
+    if role_menus.count_options(menu_id) >= role_menus.MAX_OPTIONS:
+        raise OperationError(f"A role menu holds up to {role_menus.MAX_OPTIONS} roles. Remove one first.")
+    name = _role_name(gw, guild_id, role_id)
+    text = role_menus.clean_text(label, role_menus.MAX_LABEL_LENGTH, "label") or name
+    detail = role_menus.clean_text(description, role_menus.MAX_OPTION_DESCRIPTION_LENGTH, "description")
+    if not role_menus.add_option(menu_id, role_id, text, detail):
+        raise OperationError("That role is already in this menu.")
+    audit.record(guild_id, actor, "rolemenu.add", f"#{menu_id}: {name}")
+    await _refresh_menu_message(gw, guild_id, menu)
+    return {"menu_id": menu_id, "role_id": str(role_id), "label": text}
+
+
+@_user_errors
+async def remove_role_menu_option(
+    gw: Gateway, cfg: dict, guild_id: int, actor: Actor, *, menu_id: int, role_id: int
+) -> dict[str, Any]:
+    menu = _menu_or_error(guild_id, menu_id)
+    if not role_menus.remove_option(menu_id, int(role_id)):
+        raise OperationError("That role is not in this menu.")
+    audit.record(guild_id, actor, "rolemenu.remove", f"#{menu_id}: role {role_id}")
+    await _refresh_menu_message(gw, guild_id, menu)
+    return {"menu_id": menu_id, "role_id": str(int(role_id))}
+
+
+@_user_errors
+async def post_role_menu(
+    gw: Gateway, cfg: dict, guild_id: int, actor: Actor, *, menu_id: int, channel_id: Optional[int] = None
+) -> dict[str, Any]:
+    """Post the menu. Posting again makes a second copy; later edits refresh the most recent one."""
+    menu = _menu_or_error(guild_id, menu_id)
+    options = role_menus.options_for(menu_id)
+    if not options:
+        raise OperationError("Add at least one role to the menu before posting it.")
+    target = _require_channel(gw, cfg, guild_id, channel_id)
+    sent = await gw.post(
+        guild_id,
+        target,
+        embed=role_menus.embed(menu["title"], menu["description"], options),
+        view=[role_menus.select_spec(menu_id, options)],
+    )
+    role_menus.attach_message(menu_id, target, sent["message_id"])
+    audit.record(guild_id, actor, "rolemenu.post", f"#{menu_id} in channel {target}")
+    return {"id": menu_id, "channel_id": str(target), "message_id": str(sent["message_id"]), "jump_url": sent["jump_url"]}
+
+
+@_user_errors
+async def delete_role_menu(gw: Gateway, cfg: dict, guild_id: int, actor: Actor, *, menu_id: int) -> dict[str, Any]:
+    menu = _menu_or_error(guild_id, menu_id)
+    if menu["message_id"] and menu["channel_id"]:
+        try:
+            await gw.delete_message(guild_id, menu["channel_id"], menu["message_id"])
+        except OperationError as exc:
+            logger.warning("Could not delete the message of role menu #%s: %s", menu_id, exc)
+    role_menus.delete_menu(menu_id)
+    audit.record(guild_id, actor, "rolemenu.delete", f"#{menu_id}: {menu['title']}")
+    return {"id": menu_id}
+
+
+def list_role_menus(guild_id: int) -> list[dict[str, Any]]:
+    rows = []
+    for menu in role_menus.list_menus(guild_id):
+        menu["options"] = role_menus.options_for(menu["id"])
+        rows.append(menu)
+    return rows
+
+
+async def apply_role_menu(
+    gw: Gateway,
+    guild_id: int,
+    user_id: int,
+    held_role_ids: list[int],
+    menu_id: int,
+    picked_role_ids: list[int],
+) -> tuple[list[int], list[int]]:
+    """A member's choice from a menu: give the picked roles, take away the menu's other roles.
+
+    Returns ``(roles given, roles taken)``. Roles that are not in the menu are ignored.
+    """
+    menu = role_menus.get_by_id(menu_id)
+    if menu is None or int(menu["guild_id"]) != int(guild_id):
+        raise OperationError("This role menu no longer exists.")
+    menu_roles = {int(o["role_id"]) for o in role_menus.options_for(menu_id)}
+    held = {int(r) for r in held_role_ids}
+    picked = {int(r) for r in picked_role_ids} & menu_roles
+    to_add = sorted(picked - held)
+    to_remove = sorted((menu_roles & held) - picked)
+    for role_id in to_add + to_remove:
+        problem = gw.role_problem(guild_id, role_id)
+        if problem:
+            raise OperationError(problem)
+    for role_id in to_add:
+        await gw.set_member_role(guild_id, user_id, role_id, add=True)
+    for role_id in to_remove:
+        await gw.set_member_role(guild_id, user_id, role_id, add=False)
+    return to_add, to_remove
 
 
 # --------------------------------------------------------------------------- #
@@ -1312,6 +1653,7 @@ SETTING_FIELDS = (
     "quiet_end",
     "quiet_hold_manual",
     "ticket_category_id",
+    "ticket_auto_close_days",
 )
 
 
@@ -1331,9 +1673,23 @@ def _as_flag(value: Any) -> bool:
     return bool(value)
 
 
+def _as_days(value: Any) -> int:
+    if value is None or (isinstance(value, str) and value.strip() == ""):
+        return 0
+    try:
+        days = int(value)
+    except (TypeError, ValueError):
+        raise ValueError("Auto-close must be a whole number of days, or 0 for never.") from None
+    if not 0 <= days <= MAX_AUTO_CLOSE_DAYS:
+        raise ValueError(f"Auto-close can be 0 (never) or up to {MAX_AUTO_CLOSE_DAYS} days.")
+    return days
+
+
 def _clean_setting(gw: Gateway, guild_id: int, key: str, value: Any) -> Any:
     if key in ("require_approval", "quiet_hold_manual"):
         return _as_flag(value)
+    if key == "ticket_auto_close_days":
+        return _as_days(value)
     if _is_blank(value):
         value = None
     if key == "timezone" and value:
@@ -1383,6 +1739,8 @@ async def run_scheduler(gw: Gateway, cfg: dict, *, now: Optional[datetime] = Non
         "deferred": 0,
         "unpinned": 0,
         "polls_closed": 0,
+        "polls_posted": 0,
+        "tickets_closed": 0,
         "reminders": 0,
         "approval_reminders": 0,
     }
@@ -1393,12 +1751,17 @@ async def run_scheduler(gw: Gateway, cfg: dict, *, now: Optional[datetime] = Non
     for pin in pins.list_due(now):
         await _unpin(gw, pin, counts)
 
+    for poll in polls.list_due_scheduled(now):
+        await _post_scheduled_poll(gw, cfg, poll, now, counts)
+
     for poll in polls.list_due_polls(now):
         try:
             await _finish_poll(gw, cfg, poll, SCHEDULER_ACTOR, now)
             counts["polls_closed"] += 1
         except Exception:
             logger.exception("Could not close poll #%s", poll["id"])
+
+    await _close_idle_tickets(gw, cfg, now, counts)
 
     for event in events.list_due_reminders(now):
         await _send_reminder(gw, cfg, event, counts)
