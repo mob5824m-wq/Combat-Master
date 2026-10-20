@@ -454,6 +454,26 @@ class FeatureRouteTests(DashboardTestCase):
             self.assertEqual(anonymous.status, 401)
         self.run_with(scenario)
 
+    def test_pins_route_lists_active_pins_and_the_hold_setting_saves(self):
+        async def scenario(client):
+            _, body, cookie = await login(client)
+            headers = auth_headers(cookie, body["csrf"])
+            posted = await client.post(f"api/guilds/{GUILD}/announce", json={"message": "Pinned one", "pin_for": "24h"},
+                                       headers=headers)
+            self.assertEqual(posted.status, 200)
+            pinned = await (await client.get(f"api/guilds/{GUILD}/pins", headers=auth_headers(cookie))).json()
+            self.assertEqual(len(pinned), 1)
+            self.assertIn("unpin_at", pinned[0])
+
+            saved = await client.put(
+                f"api/guilds/{GUILD}/settings",
+                json={"quiet_start": "22:00", "quiet_end": "08:00", "quiet_hold_manual": True},
+                headers=headers,
+            )
+            self.assertEqual(saved.status, 200)
+            self.assertTrue((await saved.json())["quiet_hold_manual"])
+        self.run_with(scenario)
+
     def test_settings_carry_the_new_keys_and_refuse_half_a_quiet_window(self):
         async def scenario(client):
             _, body, cookie = await login(client)

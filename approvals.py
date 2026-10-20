@@ -13,7 +13,7 @@ token, so the dashboard can not approve its own requests.
 from __future__ import annotations
 
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
 import store
@@ -25,6 +25,8 @@ PENDING = "pending"
 APPROVED = "approved"
 REJECTED = "rejected"
 SUMMARY_LIMIT = 200
+# A request still pending after this long gets a reminder in the staff log, and again each day.
+REMIND_AFTER = timedelta(hours=24)
 
 
 def _iso(moment: Optional[datetime]) -> str:
@@ -78,6 +80,24 @@ def list_pending(guild_id: int) -> list[dict[str, Any]]:
         (int(guild_id), PENDING),
     )
     return [_decode(row) for row in rows]
+
+
+def list_due_reminders(now: datetime) -> list[dict[str, Any]]:
+    """Pending requests that have waited long enough, and have not been reminded recently."""
+    cutoff = _iso(now - REMIND_AFTER)
+    rows = store.db_fetchall(
+        "SELECT * FROM approval_requests WHERE status = ? AND created_at <= ? "
+        "AND (reminded_at IS NULL OR reminded_at <= ?) ORDER BY guild_id, id",
+        (PENDING, cutoff, cutoff),
+    )
+    return [_decode(row) for row in rows]
+
+
+def mark_reminded(request_ids: list[int], now: Optional[datetime] = None) -> None:
+    for request_id in request_ids:
+        store.db_execute(
+            "UPDATE approval_requests SET reminded_at = ? WHERE id = ?", (_iso(now), int(request_id))
+        )
 
 
 def requester_of(row: dict[str, Any]) -> Actor:

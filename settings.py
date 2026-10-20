@@ -68,6 +68,7 @@ DEFAULT_GUILD: dict[str, Any] = {
     "require_approval": False,  # True -> announcements wait for another staff member
     "quiet_start": None,  # "HH:MM" in the server's timezone; None with quiet_end -> off
     "quiet_end": None,
+    "quiet_hold_manual": False,  # True -> announcements made by hand wait for quiet hours to end too
 }
 
 # Keys a dashboard or command may change, and the type each one takes.
@@ -161,6 +162,10 @@ def get_require_approval(cfg: dict[str, Any], guild_id: int) -> bool:
 def get_quiet_hours(cfg: dict[str, Any], guild_id: int) -> tuple[Optional[str], Optional[str]]:
     entry = get_guild_config(cfg, guild_id)
     return entry["quiet_start"] or None, entry["quiet_end"] or None
+
+
+def get_quiet_hold_manual(cfg: dict[str, Any], guild_id: int) -> bool:
+    return bool(get_guild_config(cfg, guild_id)["quiet_hold_manual"])
 
 
 def get_timezone_name(cfg: dict[str, Any], guild_id: int) -> str:

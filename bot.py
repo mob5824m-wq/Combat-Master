@@ -20,6 +20,7 @@ Everything staff use is reached through one slash-command group, ``/manage``:
 
     Members
       /manage welcome ...     set, turn off or test the welcome message
+      /manage pins            posts that are pinned right now
 
     Approval and quiet hours
       /manage queue           announcements waiting for a second staff member
@@ -235,6 +236,13 @@ def _warn_lines(warnings: list[str]) -> list[str]:
     return [f"⚠️ {w}" for w in warnings]
 
 
+def _held_text(result: dict[str, Any]) -> str:
+    return (
+        f"Quiet hours are on, so this is held as **#{result['schedule_id']}** and posts "
+        f"{_when_text(result['send_at'])}. Cancel it with `/manage cancel` and that number."
+    )
+
+
 def _queued_text(result: dict[str, Any]) -> str:
     return (
         f"Sent to the approval queue as **#{result['approval_id']}**. A different staff member can "
@@ -334,6 +342,9 @@ class CombatMasterCog(commands.Cog):
         if result.get("queued"):
             await self._reply(interaction, _queued_text(result))
             return
+        if result.get("held"):
+            await self._reply(interaction, _held_text(result))
+            return
         lines = [f"Posted in <#{result['channel_id']}>: {result['jump_url']}"]
         if publish and result["published"]:
             lines.append("Published to followers.")
@@ -375,6 +386,7 @@ class CombatMasterCog(commands.Cog):
         channel="Where to post. Defaults to the server's announcement channel.",
         mention="Optional role to ping each time.",
         publish="Also publish to followers (announcement channels only).",
+        pin_for="Pin each post for this long, e.g. 6h. Shorter than the repeat gap.",
     )
     async def manage_repeat(
         self,
@@ -386,10 +398,11 @@ class CombatMasterCog(commands.Cog):
         channel: Optional[discord.TextChannel] = None,
         mention: Optional[discord.Role] = None,
         publish: bool = False,
+        pin_for: Optional[app_commands.Range[str, 1, 20]] = None,
     ) -> None:
         if not await self._staff(interaction):
             return
-        await self._schedule(interaction, first_in or every, message, title, channel, mention, publish, every, None)
+        await self._schedule(interaction, first_in or every, message, title, channel, mention, publish, every, pin_for)
 
     async def _schedule(
         self, interaction, when, message, title, channel, mention, publish, repeat_every, pin_for=None
@@ -420,6 +433,8 @@ class CombatMasterCog(commands.Cog):
                 f"Repeating **#{result['id']}** starts {_when_text(result['send_at'])} "
                 f"in <#{result['channel_id']}>. Cancel it with `/manage cancel` and that number."
             )
+            if result.get("pinned"):
+                text += " Each post is pinned when it goes out."
         else:
             text = (
                 f"Scheduled **#{result['id']}** for {_when_text(result['send_at'])} "
@@ -808,7 +823,10 @@ class CombatMasterCog(commands.Cog):
             inline=True,
         )
         quiet_start, quiet_end = settings.get_quiet_hours(self.bot.config, guild_id)
-        embed.add_field(name="Quiet hours", value=f"{quiet_start} to {quiet_end}" if quiet_start else "Off", inline=True)
+        quiet_text = f"{quiet_start} to {quiet_end}" if quiet_start else "Off"
+        if quiet_start and settings.get_quiet_hold_manual(self.bot.config, guild_id):
+            quiet_text += " · holds posts by hand too"
+        embed.add_field(name="Quiet hours", value=quiet_text, inline=True)
         embed.add_field(name="Pinned", value=str(data["pins_active"]), inline=True)
         await self._reply(interaction, embed=embed)
 
@@ -867,7 +885,9 @@ class CombatMasterCog(commands.Cog):
         lines = [f"Approved **#{request_id}**."]
         if result.get("jump_url"):
             lines.append(f"Posted: {result['jump_url']}")
-        if result.get("send_at"):
+        if result.get("held"):
+            lines.append(f"Quiet hours are on, so it is held as **#{result['schedule_id']}** until {_when_text(result['send_at'])}.")
+        elif result.get("send_at"):
             lines.append(f"Scheduled for {_when_text(result['send_at'])}.")
         await self._reply(interaction, "\n".join(lines + _warn_lines(result.get("warnings", []))))
 
@@ -931,45 +951,76 @@ class CombatMasterCog(commands.Cog):
             return
         await self._reply(interaction, "Deleted the announcement.")
 
-    @manage_group.command(name="quiet", description="Hold scheduled posts overnight. Use off to turn it off.")
+    @manage_group.command(name="quiet", description="Quiet hours for scheduled posts, and optionally for posts by hand.")
     @app_commands.describe(
         start="When quiet time starts, 24-hour, e.g. 22:00. Type off to turn it off.",
         end="When it ends, 24-hour, e.g. 08:00.",
+        hold_manual="Also hold posts made by hand until quiet hours end.",
     )
     async def manage_quiet(
         self,
         interaction: discord.Interaction,
         start: Optional[app_commands.Range[str, 1, 10]] = None,
         end: Optional[app_commands.Range[str, 1, 10]] = None,
+        hold_manual: Optional[bool] = None,
     ) -> None:
         if not await self._staff(interaction):
             return
         guild_id = interaction.guild_id
-        if start is None and end is None:
+        if start is None and end is None and hold_manual is None:
             quiet_start, quiet_end = settings.get_quiet_hours(self.bot.config, guild_id)
             if quiet_start and quiet_end:
                 text = f"Quiet hours are {quiet_start} to {quiet_end} (server time). Scheduled posts wait for them to end."
+                text += (
+                    " Posts made by hand wait too."
+                    if settings.get_quiet_hold_manual(self.bot.config, guild_id)
+                    else " Posts made by hand go out at once."
+                )
             else:
                 text = "Quiet hours are off."
             await self._reply(interaction, text)
             return
+        changes: dict[str, Any] = {}
         if start is not None and start.strip().lower() == "off":
-            changes: dict[str, Any] = {"quiet_start": None, "quiet_end": None}
-        else:
-            changes = {"quiet_start": start, "quiet_end": end}
+            changes.update({"quiet_start": None, "quiet_end": None})
+        elif start is not None or end is not None:
+            changes.update({"quiet_start": start, "quiet_end": end})
+        if hold_manual is not None:
+            changes["quiet_hold_manual"] = hold_manual
         try:
             await ops.update_settings(self.bot.gateway, self.bot.config, guild_id, _actor(interaction), changes)
         except OperationError as exc:
             await self._reply(interaction, str(exc))
             return
-        if changes["quiet_start"] is None:
+        quiet_start, quiet_end = settings.get_quiet_hours(self.bot.config, guild_id)
+        holding = settings.get_quiet_hold_manual(self.bot.config, guild_id)
+        if not quiet_start:
             await self._reply(interaction, "Quiet hours are off.")
-        else:
-            await self._reply(
-                interaction,
-                f"Quiet hours set: {changes['quiet_start']} to {changes['quiet_end']} (server time). "
-                "Scheduled posts due in that window will wait for it to end.",
-            )
+            return
+        manual = "Posts made by hand wait too." if holding else "Posts made by hand go out at once."
+        await self._reply(
+            interaction,
+            f"Quiet hours set: {quiet_start} to {quiet_end} (server time). Scheduled posts due in that "
+            f"window wait for it to end. {manual}",
+        )
+
+    @manage_group.command(name="pins", description="Show posts that are pinned right now, and when they unpin.")
+    async def manage_pins(self, interaction: discord.Interaction) -> None:
+        if not await self._staff(interaction):
+            return
+        rows = ops.list_pins(interaction.guild_id)
+        if not rows:
+            await self._reply(interaction, "Nothing is pinned right now.")
+            return
+        lines = [
+            f"<#{row['channel_id']}> · [jump to post](https://discord.com/channels/"
+            f"{row['guild_id']}/{row['channel_id']}/{row['message_id']}) · unpins {_when_text(row['unpin_at'])}"
+            for row in rows[:25]
+        ]
+        if len(rows) > 25:
+            lines.append(f"...and {len(rows) - 25} more.")
+        embed = discord.Embed(title="Pinned posts", description="\n".join(lines)[:4000], color=ann.EMBED_COLOR)
+        await self._reply(interaction, embed=embed)
 
     @manage_group.command(name="setup", description="Set the staff role, channels, timezone and dashboard links.")
     @app_commands.describe(

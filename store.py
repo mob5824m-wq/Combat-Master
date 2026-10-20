@@ -140,7 +140,8 @@ CREATE TABLE IF NOT EXISTS approval_requests (
     decided_source    TEXT,
     decided_name      TEXT,
     decided_at        TEXT,
-    created_at        TEXT NOT NULL
+    created_at        TEXT NOT NULL,
+    reminded_at       TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_approvals_guild ON approval_requests (guild_id, status);
 
@@ -160,6 +161,7 @@ CREATE INDEX IF NOT EXISTS idx_pins_due ON pinned_posts (status, unpin_at);
 
 # Columns added after a first release. (table, column, declaration)
 _ADDED_COLUMNS = [
+    ("approval_requests", "reminded_at", "TEXT"),
     ("scheduled_announcements", "publish", "INTEGER NOT NULL DEFAULT 0"),
     ("scheduled_announcements", "interval_seconds", "INTEGER"),
     ("scheduled_announcements", "runs", "INTEGER NOT NULL DEFAULT 0"),

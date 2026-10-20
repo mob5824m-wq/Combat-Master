@@ -274,11 +274,34 @@ class PinTests(FeatureTestCase):
         self.scheduler(NOW + timedelta(hours=3, minutes=1))
         self.assertEqual(self.gw.pinned, set())
 
-    def test_repeating_announcements_can_not_be_pinned(self):
-        with self.assertRaisesRegex(OperationError, "Repeating"):
+    def test_a_repeat_pin_must_end_before_the_next_post(self):
+        with self.assertRaisesRegex(OperationError, "shorter"):
             run(ops.schedule_announcement(
-                self.gw, self.cfg, GUILD, ADA, when="1h", message="Again", repeat_every="1d", pin_for="1h", now=NOW
+                self.gw, self.cfg, GUILD, ADA, when="1h", message="Again", repeat_every="1d", pin_for="1d", now=NOW
             ))
+
+    def test_each_repeat_is_pinned_and_unpinned_in_turn(self):
+        run(ops.schedule_announcement(
+            self.gw, self.cfg, GUILD, ADA, when="1h", message="Again", repeat_every="1d", pin_for="6h", now=NOW
+        ))
+        self.scheduler(NOW + timedelta(hours=1, minutes=1))
+        self.assertEqual(len(self.gw.pinned), 1)
+        first = next(iter(self.gw.pinned))
+
+        self.scheduler(NOW + timedelta(hours=8))  # the first copy's pin has run out
+        self.assertNotIn(first, self.gw.pinned)
+        self.assertEqual(self.gw.pinned, set())
+
+        self.scheduler(NOW + timedelta(days=1, hours=1, minutes=1))  # the next day's post
+        self.assertEqual(len(self.gw.pinned), 1)
+        self.assertNotIn(first, self.gw.pinned)
+
+    def test_list_pins_shows_only_active_pins(self):
+        result = self.announce(pin_for="24h")
+        rows = ops.list_pins(GUILD)
+        self.assertEqual([int(row["message_id"]) for row in rows], [int(result["message_id"])])
+        self.scheduler(NOW + timedelta(hours=25))
+        self.assertEqual(ops.list_pins(GUILD), [])
 
     def test_a_pin_that_is_too_short_is_refused(self):
         with self.assertRaisesRegex(OperationError, "at least 5 minutes"):
@@ -456,6 +479,120 @@ class QueueSummaryTests(FeatureTestCase):
         summary = ops.list_approvals(GUILD)[0]["summary"]
         self.assertLessEqual(len(summary), 120)
         self.assertTrue(summary.endswith("…"))
+
+
+class QuietHoldManualTests(FeatureTestCase):
+    """Quiet hours that also hold posts made by hand."""
+
+    IN_WINDOW = datetime(2026, 10, 17, 3, 0, tzinfo=timezone.utc)  # 23:00 on 16 October in Toronto
+    WINDOW_END = datetime(2026, 10, 17, 12, 0, tzinfo=timezone.utc)  # 08:00 on 17 October
+
+    def setUp(self) -> None:
+        super().setUp()
+        settings.set_guild_value(self.cfg, GUILD, "quiet_start", "22:00")
+        settings.set_guild_value(self.cfg, GUILD, "quiet_end", "08:00")
+
+    def hold_by_hand(self, on: bool = True) -> None:
+        settings.set_guild_value(self.cfg, GUILD, "quiet_hold_manual", on)
+
+    def test_off_by_default_a_hand_post_goes_out_in_quiet_hours(self):
+        self.announce(now=self.IN_WINDOW)
+        self.assertEqual(len(self.posts_in_announce()), 1)
+
+    def test_when_on_a_hand_post_in_quiet_hours_is_held_until_they_end(self):
+        self.hold_by_hand()
+        result = self.announce(now=self.IN_WINDOW)
+        self.assertTrue(result["held"])
+        self.assertEqual(self.posts_in_announce(), [])
+        rows = ann.list_pending(GUILD)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["send_at"], ann.iso_utc(self.WINDOW_END))
+        self.assertIn("quiet.hold", self.audit_actions())
+
+        self.scheduler(self.WINDOW_END - timedelta(minutes=1))
+        self.assertEqual(self.posts_in_announce(), [])
+        self.scheduler(self.WINDOW_END + timedelta(minutes=1))
+        self.assertEqual(len(self.posts_in_announce()), 1)
+
+    def test_when_on_a_hand_post_outside_quiet_hours_goes_out_at_once(self):
+        self.hold_by_hand()
+        result = self.announce(now=NOW)
+        self.assertFalse(result.get("held"))
+        self.assertEqual(len(self.posts_in_announce()), 1)
+
+    def test_a_held_post_keeps_its_pin_and_author(self):
+        self.hold_by_hand()
+        self.announce(now=self.IN_WINDOW, actor=ADA, pin_for="24h")
+        row = ann.list_pending(GUILD)[0]
+        self.assertEqual(row["author_name"], "Ada")
+        self.assertEqual(row["pin_seconds"], 86400)
+        self.scheduler(self.WINDOW_END + timedelta(minutes=1))
+        self.assertEqual(len(self.gw.pinned), 1)
+
+    def test_an_approved_hand_post_is_held_too(self):
+        self.hold_by_hand()
+        self.require_approval()
+        self.announce(now=self.IN_WINDOW, actor=ADA)
+        self.assertEqual(self.posts_in_announce(), [])
+        result = run(ops.approve_request(self.gw, self.cfg, GUILD, BEN, 1, now=self.IN_WINDOW))
+        self.assertTrue(result["held"])
+        self.assertEqual(self.posts_in_announce(), [])
+        self.assertEqual(len(ann.list_pending(GUILD)), 1)
+
+    def test_the_setting_is_saved_through_update_settings(self):
+        run(ops.update_settings(self.gw, self.cfg, GUILD, ADA, {"quiet_hold_manual": True}))
+        self.assertTrue(settings.get_quiet_hold_manual(self.cfg, GUILD))
+        run(ops.update_settings(self.gw, self.cfg, GUILD, ADA, {"quiet_hold_manual": "no"}))
+        self.assertFalse(settings.get_quiet_hold_manual(self.cfg, GUILD))
+
+
+class ApprovalReminderTests(FeatureTestCase):
+    """A request left waiting for a day is mentioned in the staff log, once a day."""
+
+    def queue_one(self) -> None:
+        self.require_approval()
+        self.announce(actor=ADA, title="Waiting")
+
+    def reminders(self) -> list[dict]:
+        return [
+            p for p in self.gw.posts
+            if p["channel_id"] == STAFF_LOG and p["embed"] is not None and "still waiting" in p["embed"].title
+        ]
+
+    def test_no_reminder_before_a_day(self):
+        self.queue_one()
+        counts = self.scheduler(NOW + timedelta(hours=23))
+        self.assertEqual(counts["approval_reminders"], 0)
+        self.assertEqual(self.reminders(), [])
+
+    def test_one_reminder_after_a_day_then_not_again_that_day(self):
+        self.queue_one()
+        counts = self.scheduler(NOW + timedelta(hours=25))
+        self.assertEqual(counts["approval_reminders"], 1)
+        self.assertEqual(len(self.reminders()), 1)
+        again = self.scheduler(NOW + timedelta(hours=26))
+        self.assertEqual(again["approval_reminders"], 0)
+        self.assertEqual(len(self.reminders()), 1)
+
+    def test_reminded_again_a_day_later_while_still_pending(self):
+        self.queue_one()
+        self.scheduler(NOW + timedelta(hours=25))
+        counts = self.scheduler(NOW + timedelta(hours=50))
+        self.assertEqual(counts["approval_reminders"], 1)
+        self.assertEqual(len(self.reminders()), 2)
+
+    def test_a_decided_request_is_not_reminded(self):
+        self.queue_one()
+        run(ops.reject_request(GUILD, BEN, 1, now=NOW + timedelta(hours=1)))
+        counts = self.scheduler(NOW + timedelta(hours=25))
+        self.assertEqual(counts["approval_reminders"], 0)
+
+    def test_without_a_staff_log_the_reminder_waits_until_there_is_one(self):
+        settings.set_guild_value(self.cfg, GUILD, "staff_channel_id", None)
+        self.queue_one()
+        self.assertEqual(self.scheduler(NOW + timedelta(hours=25))["approval_reminders"], 0)
+        settings.set_guild_value(self.cfg, GUILD, "staff_channel_id", STAFF_LOG)
+        self.assertEqual(self.scheduler(NOW + timedelta(hours=26))["approval_reminders"], 1)
 
 
 class AuditExportTests(FeatureTestCase):

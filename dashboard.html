@@ -122,13 +122,15 @@
             <select name="mention_role_id" class="role-select"></select>
           </label>
           <label>Pin for (optional)
-            <input name="pin_for" placeholder="24h, 3d. One-offs only">
+            <input name="pin_for" placeholder="24h, 3d. For repeats, shorter than the gap">
           </label>
           <label class="check"><input type="checkbox" name="publish"> Publish to followers</label>
           <div class="actions span2"><button type="submit">Schedule</button></div>
         </form>
         <h3>Waiting to go out</h3>
         <ul id="scheduled-list" class="list"></ul>
+        <h3>Pinned now</h3>
+        <ul id="pin-list" class="list"></ul>
       </section>
 
       <!-- Approval queue -->
@@ -261,6 +263,7 @@
           <label>Quiet hours end
             <input name="quiet_end" placeholder="08:00">
           </label>
+          <label class="check span2"><input type="checkbox" name="quiet_hold_manual"> Also hold posts made by hand until quiet hours end</label>
           <p class="span2 muted">Quiet hours hold scheduled and repeating posts until the window ends. Use 24-hour times in the server's timezone. Leave both empty to turn them off.</p>
           <p class="span2 muted">Staff role: once set, only its holders (and administrators) can use staff tools. Leave it empty to fall back to Manage Server.</p>
           <div class="actions span2"><button type="submit">Save settings</button></div>

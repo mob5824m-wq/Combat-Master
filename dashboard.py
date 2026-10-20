@@ -174,6 +174,7 @@ class DashboardServer:
         r.add_get(f"{g}/history", self._history)
         r.add_post(f"{g}/announce", self._announce)
         r.add_get(f"{g}/scheduled", self._scheduled_list)
+        r.add_get(f"{g}/pins", self._pins_list)
         r.add_post(f"{g}/scheduled", self._scheduled_create)
         r.add_delete(f"{g}/scheduled/{{sid}}", self._scheduled_cancel)
         r.add_get(f"{g}/templates", self._templates_list)
@@ -426,6 +427,7 @@ class DashboardServer:
             "require_approval": cfg["require_approval"],
             "quiet_start": cfg["quiet_start"],
             "quiet_end": cfg["quiet_end"],
+            "quiet_hold_manual": cfg["quiet_hold_manual"],
             "default_welcome_message": welcome.DEFAULT_WELCOME_MESSAGE,
             "placeholders": list(welcome.PLACEHOLDERS),
         }
@@ -477,6 +479,11 @@ class DashboardServer:
         self._authed(request)
         guild = await self._guild(request)
         return self._json(ops.list_schedule(guild["id"]))
+
+    async def _pins_list(self, request: web.Request) -> web.Response:
+        self._authed(request)
+        guild = await self._guild(request)
+        return self._json(ops.list_pins(guild["id"]))
 
     async def _scheduled_create(self, request: web.Request) -> web.Response:
         self._authed(request)

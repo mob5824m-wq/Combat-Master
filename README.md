@@ -28,7 +28,8 @@ Everything in Discord is one command group, `/manage`. Type `/manage` to see it:
 /manage delete               delete a post the bot made
 /manage queue               announcements waiting for approval
 /manage approve | reject     approve or turn down a queued announcement
-/manage quiet               show, set or clear quiet hours
+/manage quiet               show, set or clear quiet hours, and whether they hold posts by hand
+/manage pins                posts that are pinned right now, and when they unpin
 /manage status              this server's settings and what is pending
 /manage audit               who did what, newest first
 /manage setup               staff role, channels and timezone         (administrators)
@@ -48,7 +49,9 @@ Everything in Discord is one command group, `/manage`. Type `/manage` to see it:
   server's timezone). The scheduler checks every 30 seconds.
 * **Repeating announcements.** `/manage repeat` posts again every interval (at
   least 15 minutes, at most 365 days). A repeat that was missed while the bot
-  was offline is skipped, not posted in a burst. A repeat stays queued until
+  was offline is skipped, not posted in a burst. A repeat can be pinned too, with
+  `pin_for`; each copy is pinned for that long, so the pin must be shorter than the
+  gap between posts, and only one copy is pinned at a time. A repeat stays queued until
   you cancel it.
 * **Templates.** Save text once with `/manage template save`, then post it with
   `/manage template use`. Names are unique per server, ignore case, and use
@@ -66,14 +69,15 @@ Everything in Discord is one command group, `/manage`. Type `/manage` to see it:
   intent (see [Invite the bot](#invite-the-bot)).
 * **Approval queue.** When *Require approval* is on in `/manage setup` (or the
   dashboard's Settings), announcements and scheduled posts wait in `/manage queue`
-  until someone else approves them. Nobody can approve their own request. The
+  until someone else approves them. A request still waiting after a day is mentioned
+  in the staff log, once a day until it is decided. Nobody can approve their own request. The
   dashboard signs in as one shared identity, so a request made on the dashboard must
   be approved in Discord, and a request made in Discord can be approved on the
   dashboard's Approvals tab. Turn a request down with `/manage reject` or the same tab.
-* **Pinning and auto-unpin.** `pin_for` on `/manage announce` and on one-off
-  `/manage schedule` pins the post for a set time, from 5 minutes to 30 days, then
-  unpins it. Repeating posts are not pinned. If the pin can not be made, the post
-  still goes out and the reply says so.
+* **Pinning and auto-unpin.** `pin_for` on `/manage announce`, `/manage schedule`
+  and `/manage repeat` pins the post for a set time, from 5 minutes to 30 days, then
+  unpins it. `/manage pins` lists what is pinned now. If the pin can not be made, the
+  post still goes out and the reply says so.
 * **Edit and delete.** `/manage edit` changes the heading or text of a post the bot
   made, and `/manage delete` removes it. Copy the message ID with Discord's *Copy
   Message ID*. Only posts the bot recorded can be changed, so a message staff typed by
@@ -81,8 +85,9 @@ Everything in Discord is one command group, `/manage`. Type `/manage` to see it:
 * **Quiet hours.** `/manage quiet start:22:00 end:08:00` (in the server's timezone) holds
   scheduled and repeating posts that come due in the window, and posts them when it
   ends. A post made by hand with `/manage announce` or the dashboard's Announce tab
-  goes out at once. `/manage quiet start:off` clears the window, and a window can
-  cross midnight.
+  goes out at once, unless you also set `hold_manual:True`. Then those are saved and
+  posted when the window ends. `/manage quiet start:off` clears the window, and a
+  window can cross midnight.
 * **Publish to followers.** In an announcement (news) channel, tick *publish*
   and the message is also sent to every server that follows the channel.
 * **Failures are not silent.** If a scheduled post can not go out (channel
@@ -179,7 +184,7 @@ Every option is optional, and only the ones you pass are changed.
 
 | Command | Who |
 |---------|-----|
-| Everything except `setup` and `fixcommands` (announce, schedule, repeat, scheduled, cancel, history, template, poll, event, welcome, edit, delete, queue, approve, reject, quiet, status, audit) | Holders of the **staff role**, and administrators |
+| Everything except `setup` and `fixcommands` (announce, schedule, repeat, scheduled, cancel, history, template, poll, event, welcome, edit, delete, queue, approve, reject, quiet, pins, status, audit) | Holders of the **staff role**, and administrators |
 | `setup`, `fixcommands` | Administrators |
 | The dashboard | Anyone with the dashboard token (see [section 4](#4-the-dashboard)) |
 
@@ -303,7 +308,7 @@ own timezone. The dashboard shows times in the server's timezone.
 | Event title | 256 characters; details 1000 characters |
 | Event reminder | 5 minutes to 7 days before the start (0 for none); mentions up to 50 people |
 | Welcome message | 1000 characters |
-| Pin time (`pin_for`) | 5 minutes to 30 days |
+| Pin time (`pin_for`) | 5 minutes to 30 days; for a repeat, shorter than the gap between posts |
 | Quiet hours | Both a start and an end, e.g. `22:00` and `08:00`; clear both with `off` |
 | Lists in Discord | up to 25 entries (`history`, `scheduled`, `poll list`, `event list`) |
 
@@ -315,7 +320,7 @@ command_tree.py     the /manage group and the administrator check
 operations.py       every staff action (commands and dashboard both call these)
 announcements.py    time parsing, announcement embeds, posting rules, history, templates
 polls.py            poll options, vote counting, poll storage
-approvals.py        the approval queue: who asked, who decided, and the record
+approvals.py        the approval queue: who asked, who decided, reminders
 pins.py             pins that are waiting to be removed
 quiet.py            quiet-hours clock times and the overnight window
 events.py           event checks, RSVP embeds, reminders, event storage

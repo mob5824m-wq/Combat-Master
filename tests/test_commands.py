@@ -137,7 +137,7 @@ class CommandTreeTests(unittest.TestCase):
             set(top),
             {"announce", "schedule", "repeat", "scheduled", "cancel", "history", "template",
              "poll", "event", "welcome", "status", "audit", "setup", "fixcommands",
-             "queue", "approve", "reject", "edit", "delete", "quiet"},
+             "queue", "approve", "reject", "edit", "delete", "quiet", "pins"},
         )
         self.assertEqual({c.name for c in top["template"].commands}, {"save", "list", "delete", "use"})
         self.assertEqual({c.name for c in top["poll"].commands}, {"create", "list", "close"})
@@ -433,11 +433,40 @@ class CommandFeatureTests(unittest.TestCase):
         self.call("manage_quiet", bad, start="25:00", end="08:00")
         self.assertEqual(settings.get_quiet_hours(bot_module.bot.config, GUILD), (None, None))
 
+    def test_pins_lists_what_is_pinned_now(self):
+        empty = self.ada()
+        self.call("manage_pins", empty)
+        self.assertIn("Nothing is pinned", empty.followup.last_text)
+
+        self.call("manage_announce", self.ada(), message="Pin me", pin_for="24h")
+        listing = self.ada()
+        self.call("manage_pins", listing)
+        self.assertEqual(listing.followup.sent[-1]["embed"].title, "Pinned posts")
+
+    def test_repeat_accepts_a_pin_and_says_so(self):
+        interaction = self.ada()
+        self.call("manage_repeat", interaction, every="1d", message="Daily", title=None, first_in="1h",
+                  channel=None, mention=None, publish=False, pin_for="6h")
+        self.assertIn("Repeating", interaction.followup.last_text)
+        self.assertIn("pinned when it goes out", interaction.followup.last_text)
+
+    def test_quiet_hold_by_hand_is_set_and_reported(self):
+        set_up = self.ada()
+        self.call("manage_quiet", set_up, start="22:00", end="08:00", hold_manual=True)
+        self.assertIn("Posts made by hand wait too.", set_up.followup.last_text)
+        self.assertTrue(settings.get_quiet_hold_manual(bot_module.bot.config, GUILD))
+
+        only_flag = self.ada()
+        self.call("manage_quiet", only_flag, start=None, end=None, hold_manual=False)
+        self.assertFalse(settings.get_quiet_hold_manual(bot_module.bot.config, GUILD))
+        self.assertEqual(settings.get_quiet_hours(bot_module.bot.config, GUILD), ("22:00", "08:00"))
+
     def test_outsiders_cannot_use_the_new_commands(self):
         outsider = fake_interaction(user_id=77, name="Eve")
         self.call("manage_queue", outsider)
         self.call("manage_approve", outsider, request_id=1)
         self.call("manage_quiet", outsider, start="22:00", end="08:00")
+        self.call("manage_pins", outsider)
         self.assertEqual(settings.get_quiet_hours(bot_module.bot.config, GUILD), (None, None))
         self.assertEqual(self.announcement_posts(), [])
 

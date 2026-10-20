@@ -300,7 +300,7 @@
           text: `#${channel.name}${channel.news ? " (announcements)" : ""}`,
         }));
       }
-      select.replaceChildren(...options);
+      replaceOptions(select, options);
     }
     for (const select of $$("select.role-select")) {
       const form = select.closest("form");
@@ -308,8 +308,16 @@
       for (const role of snapshot.roles) {
         options.push(el("option", { value: role.id, text: `@${role.name}` }));
       }
-      select.replaceChildren(...options);
+      replaceOptions(select, options);
     }
+  }
+
+  // Rebuilding a dropdown must not lose what is chosen in it. Other forms share these
+  // lists, so posting an announcement used to reset the settings form's channel to "Not set".
+  function replaceOptions(select, options) {
+    const chosen = select.value;
+    select.replaceChildren(...options);
+    if (options.some((option) => option.value === chosen)) select.value = chosen;
   }
 
   function fillSettingsForm() {
@@ -323,6 +331,7 @@
     form.elements.require_approval.checked = Boolean(s.require_approval);
     form.elements.quiet_start.value = s.quiet_start || "";
     form.elements.quiet_end.value = s.quiet_end || "";
+    form.elements.quiet_hold_manual.checked = Boolean(s.quiet_hold_manual);
   }
 
   function fillWelcomeForm() {
@@ -451,6 +460,10 @@
     form.hidden = true;
   }
 
+  function heldNotice(result) {
+    return `Quiet hours are on, so this is held as #${result.schedule_id} and posts ${fmtTime(result.send_at)}.`;
+  }
+
   function approvalNotice(result) {
     return `Sent for approval as #${result.approval_id}. Someone other than you can approve it in the Approvals tab.`;
   }
@@ -492,7 +505,7 @@
           pin_for: opt(f, "pin_for"),
         },
       }),
-      (r) => (r.queued ? approvalNotice(r) : withWarnings(
+      (r) => (r.queued ? approvalNotice(r) : r.held ? withWarnings(heldNotice(r), r) : withWarnings(
         `Posted${r.jump_url ? `: ${r.jump_url}` : "."}${r.pinned_until ? ` Pinned until ${fmtTime(r.pinned_until)}.` : ""}`,
         r,
       )),
@@ -538,8 +551,21 @@
   });
 
   async function loadScheduled() {
-    const rows = await api(`guilds/${state.guildId}/scheduled`);
+    const [rows, pinned] = await Promise.all([
+      api(`guilds/${state.guildId}/scheduled`),
+      api(`guilds/${state.guildId}/pins`),
+    ]);
     renderList($("#scheduled-list"), rows, scheduledRow, "Nothing is waiting to go out.");
+    renderList($("#pin-list"), pinned, pinRow, "Nothing is pinned right now.");
+  }
+
+  function pinRow(row) {
+    return el("li", {}, [
+      el("div", { class: "grow" }, [
+        el("strong", { text: `Pinned post in channel ${row.channel_id}` }),
+        el("div", { class: "meta", text: `unpins ${fmtTime(row.unpin_at)}` }),
+      ]),
+    ]);
   }
 
   function scheduledRow(row) {
@@ -578,7 +604,7 @@
     approve.addEventListener("click", () => {
       if (!window.confirm(`Approve #${row.id} and send it now?`)) return;
       runAction(approve, () => api(`guilds/${state.guildId}/approvals/${row.id}/approve`, { method: "POST" }),
-        (r) => (r.jump_url ? `Approved and posted: ${r.jump_url}` : `Approved #${row.id}.`), loadApprovals);
+        (r) => (r.held ? heldNotice(r) : r.jump_url ? `Approved and posted: ${r.jump_url}` : `Approved #${row.id}.`), loadApprovals);
     });
     const reject = el("button", { type: "button", class: "danger small", text: "Reject" });
     reject.addEventListener("click", () => {
@@ -844,6 +870,7 @@
           require_approval: f.has("require_approval"),
           quiet_start: opt(f, "quiet_start"),
           quiet_end: opt(f, "quiet_end"),
+          quiet_hold_manual: f.has("quiet_hold_manual"),
         },
       }),
       "Settings saved.",

@@ -217,6 +217,23 @@ async def _post_announcement(
 ) -> dict[str, Any]:
     """Post an announcement now and record it. Used by staff posts and approved requests."""
     now = _now(now)
+    held_until = _manual_hold_until(cfg, guild_id, now)
+    if held_until is not None:
+        return _hold_manual_post(
+            cfg,
+            gw,
+            guild_id,
+            actor,
+            held_until,
+            message=message,
+            title=title,
+            channel_id=channel_id,
+            mention_role_id=mention_role_id,
+            publish=publish,
+            pin_seconds=pin_seconds,
+            now=now,
+            approved_by=approved_by,
+        )
     embed = ann.build_announcement_embed(title=title, body=message, author_name=actor.name)
     sent = await gw.post(
         guild_id,
@@ -268,6 +285,56 @@ async def _post_announcement(
         "published": bool(sent.get("published")),
         "pinned_until": pinned_until,
         "warnings": warnings,
+    }
+
+
+def _manual_hold_until(cfg: dict, guild_id: int, now: datetime) -> Optional[datetime]:
+    """When a post made by hand must wait until, or None if it can go out now."""
+    if not settings.get_quiet_hold_manual(cfg, guild_id):
+        return None
+    start, end = settings.get_quiet_hours(cfg, guild_id)
+    return quiet.window_end(now, settings.get_timezone_name(cfg, guild_id), start, end)
+
+
+def _hold_manual_post(
+    cfg: dict,
+    gw: Gateway,
+    guild_id: int,
+    actor: Actor,
+    held_until: datetime,
+    *,
+    message: str,
+    title: str,
+    channel_id: int,
+    mention_role_id: Optional[int],
+    publish: bool,
+    pin_seconds: Optional[int],
+    now: datetime,
+    approved_by: Optional[Actor] = None,
+) -> dict[str, Any]:
+    """Quiet hours are on and hold-by-hand is set: save the post for when the window ends."""
+    details: dict[str, Any] = {
+        "send_at": ann.iso_utc(held_until),
+        "message": message,
+        "title": title,
+        "channel_id": channel_id,
+        "mention_role_id": mention_role_id,
+        "publish": bool(publish),
+        "interval_seconds": None,
+        "pin_seconds": pin_seconds,
+    }
+    created = _create_schedule(gw, guild_id, actor, details, now=now, approved_by=approved_by)
+    audit.record(guild_id, actor, "quiet.hold", f"#{created['id']} held until {created['send_at']}")
+    return {
+        "held": True,
+        "schedule_id": created["id"],
+        "send_at": created["send_at"],
+        "channel_id": channel_id,
+        "message_id": None,
+        "jump_url": None,
+        "published": False,
+        "pinned_until": None,
+        "warnings": created["warnings"],
     }
 
 
@@ -417,8 +484,11 @@ async def schedule_announcement(
     send_at = ann.parse_send_time(when, now, settings.get_timezone_name(cfg, guild_id))
     interval = ann.parse_interval(repeat_every) if repeat_every else None
     pin_seconds = ann.parse_pin(pin_for)
-    if pin_seconds and interval:
-        raise ValueError("Repeating announcements can not be pinned. Schedule a one-off post to pin it.")
+    if pin_seconds and interval and pin_seconds >= interval:
+        raise ValueError(
+            "A repeating post's pin must be shorter than the time between posts, so only one copy "
+            "is pinned at a time. Pin it for less than the repeat interval."
+        )
     target = _require_channel(gw, cfg, guild_id, channel_id)
     details: dict[str, Any] = {
         # Stored as an absolute time, so a request that waits in the queue keeps its meaning.
@@ -567,6 +637,11 @@ def cancel_schedule(guild_id: int, actor: Actor, schedule_id: int) -> None:
 
 def list_schedule(guild_id: int) -> list[dict[str, Any]]:
     return ann.list_pending(guild_id)
+
+
+def list_pins(guild_id: int) -> list[dict[str, Any]]:
+    """Posts that are pinned right now, soonest to unpin first."""
+    return pins.list_active(guild_id)
 
 
 def list_history(guild_id: int, limit: int = ann.DEFAULT_HISTORY_LIMIT) -> list[dict[str, Any]]:
@@ -894,6 +969,7 @@ SETTING_FIELDS = (
     "require_approval",
     "quiet_start",
     "quiet_end",
+    "quiet_hold_manual",
 )
 
 
@@ -914,7 +990,7 @@ def _as_flag(value: Any) -> bool:
 
 
 def _clean_setting(gw: Gateway, guild_id: int, key: str, value: Any) -> Any:
-    if key == "require_approval":
+    if key in ("require_approval", "quiet_hold_manual"):
         return _as_flag(value)
     if _is_blank(value):
         value = None
@@ -959,7 +1035,15 @@ async def update_settings(gw: Gateway, cfg: dict, guild_id: int, actor: Actor, c
 async def run_scheduler(gw: Gateway, cfg: dict, *, now: Optional[datetime] = None) -> dict[str, int]:
     """Do everything that is due: scheduled posts, unpins, poll closes, event reminders."""
     now = _now(now)
-    counts = {"posted": 0, "failed": 0, "deferred": 0, "unpinned": 0, "polls_closed": 0, "reminders": 0}
+    counts = {
+        "posted": 0,
+        "failed": 0,
+        "deferred": 0,
+        "unpinned": 0,
+        "polls_closed": 0,
+        "reminders": 0,
+        "approval_reminders": 0,
+    }
 
     for row in ann.list_due_scheduled(now):
         await _run_scheduled(gw, cfg, row, now, counts)
@@ -977,7 +1061,40 @@ async def run_scheduler(gw: Gateway, cfg: dict, *, now: Optional[datetime] = Non
     for event in events.list_due_reminders(now):
         await _send_reminder(gw, cfg, event, counts)
 
+    await _remind_waiting_approvals(gw, cfg, now, counts)
+
     return counts
+
+
+async def _remind_waiting_approvals(gw: Gateway, cfg: dict, now: datetime, counts: dict[str, int]) -> None:
+    """Remind the staff log about requests that have waited a day. One message per server."""
+    by_guild: dict[int, list[dict[str, Any]]] = {}
+    for row in approvals.list_due_reminders(now):
+        by_guild.setdefault(int(row["guild_id"]), []).append(row)
+    for guild_id, waiting in by_guild.items():
+        # Without a staff log nobody would see the reminder, so the request stays due until one is set.
+        if not settings.get_staff_channel_id(cfg, guild_id):
+            continue
+        try:
+            lines = [
+                f"**#{row['id']}** · {row['kind']} · requested by {row['requester_name']} · "
+                f"since {ann.discord_time(ann.parse_stored(row['created_at']))}"
+                for row in waiting[:25]
+            ]
+            if len(waiting) > 25:
+                lines.append(f"...and {len(waiting) - 25} more.")
+            embed = discord.Embed(
+                title=f"{len(waiting)} request(s) still waiting for approval",
+                description="\n".join(lines)[:4000],
+                color=ann.EMBED_COLOR,
+            )
+            embed.set_footer(text="Approve with /manage approve, or turn one down with /manage reject.")
+            await _log(gw, cfg, guild_id, embed)
+            approvals.mark_reminded([int(row["id"]) for row in waiting], now)
+            counts["approval_reminders"] += len(waiting)
+            audit.record(guild_id, SCHEDULER_ACTOR, "approval.remind", f"{len(waiting)} waiting")
+        except Exception:
+            logger.exception("Could not send the approval reminder for server %s", guild_id)
 
 
 async def _unpin(gw: Gateway, pin: dict[str, Any], counts: dict[str, int]) -> None:
@@ -1051,7 +1168,7 @@ async def _run_scheduled(gw: Gateway, cfg: dict, row: dict[str, Any], now: datet
                 source=f"Schedule #{row['id']}",
             ),
         )
-        if row.get("pin_seconds") and not repeating:
+        if row.get("pin_seconds"):
             _, pin_warnings = await _pin(gw, guild_id, channel_id, sent["message_id"], int(row["pin_seconds"]), now)
             for note in pin_warnings:
                 await _log(
