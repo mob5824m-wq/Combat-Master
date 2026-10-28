@@ -131,12 +131,16 @@ class CombatMasterBot(commands.Bot):
             logger.info("Dashboard disabled (dashboard_enabled is false).")
             return
         try:
-            token = ensure_dashboard_token(self.config)
+            host = str(self.config.get("dashboard_host") or "127.0.0.1")
+            # A loopback-only dashboard is reachable locally or through SSH
+            # forwarding, so do not prompt for a second password. Retain token
+            # protection if the operator explicitly binds beyond this machine.
+            token = None if DashboardServer._is_loopback_host(host) else ensure_dashboard_token(self.config)
             self.dashboard = DashboardServer(
                 self.gateway,
                 self.config,
                 token=token,
-                host=str(self.config.get("dashboard_host") or "127.0.0.1"),
+                host=host,
                 port=int(self.config.get("dashboard_port") or 8765),
                 allowed_hosts=self.config.get("dashboard_allowed_hosts") or [],
                 trusted_proxies=self.config.get("dashboard_trusted_proxies") or [],
@@ -1591,8 +1595,6 @@ def main(argv: Optional[list[str]] = None) -> int:
             paths.config_path(),
         )
         return 1
-    if bot.config.get("dashboard_enabled", True):
-        ensure_dashboard_token(bot.config)
     try:
         bot.run(token, log_handler=None)
     except discord.LoginFailure:

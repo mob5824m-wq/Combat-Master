@@ -327,11 +327,25 @@ class DemoModeTests(DashboardTestCase):
             self.assertEqual(posted.status, 200)
         self.run_with(scenario, demo=True, allowed_hosts=["*"])
 
-    def test_live_mode_still_needs_a_token(self):
+    def test_loopback_live_mode_opens_without_password_but_keeps_csrf(self):
         async def scenario(client):
-            self.assertFalse((await (await client.get("/api/session")).json())["authenticated"])
-            self.assertEqual((await client.get("/api/guilds")).status, 401)
-        self.run_with(scenario)
+            session_response = await client.get("/api/session")
+            session = await session_response.json()
+            self.assertTrue(session["authenticated"])
+            self.assertFalse(session["login_required"])
+            self.assertTrue(session_response.cookies[SESSION_COOKIE]["httponly"])
+            self.assertEqual((await client.get("/api/guilds")).status, 200)
+
+            payload = {"message": "Local tunnel post", "channel_id": ANNOUNCE}
+            refused = await client.post(f"api/guilds/{GUILD}/announce", json=payload)
+            self.assertEqual(refused.status, 403)
+            posted = await client.post(
+                f"api/guilds/{GUILD}/announce", json=payload,
+                headers={"X-CSRF-Token": session["csrf"]},
+            )
+            self.assertEqual(posted.status, 200)
+            self.assertEqual((await client.post("api/login", json={"token": "anything"})).status, 404)
+        self.run_with(scenario, token=None)
 
 
 class TokenTests(DashboardTestCase):
@@ -343,9 +357,11 @@ class TokenTests(DashboardTestCase):
         saved = json.loads(paths.config_path().read_text(encoding="utf-8"))
         self.assertEqual(saved["dashboard_token"], first)
 
-    def test_server_needs_a_token(self):
-        with self.assertRaises(ValueError):
-            DashboardServer(self.gw, copy.deepcopy(self.cfg), token="")
+    def test_passwordless_server_is_only_allowed_on_loopback(self):
+        server = DashboardServer(self.gw, copy.deepcopy(self.cfg), token=None, host="127.0.0.1")
+        self.assertIsNone(server.token)
+        with self.assertRaisesRegex(ValueError, "only allowed on loopback"):
+            DashboardServer(self.gw, copy.deepcopy(self.cfg), token=None, host="0.0.0.0")
 
 
 

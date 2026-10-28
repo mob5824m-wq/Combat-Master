@@ -8,7 +8,7 @@ Config shape (``data/config.json``)::
       "dashboard_enabled": true,
       "dashboard_host": "127.0.0.1",
       "dashboard_port": 8765,
-      "dashboard_token": "...",            # generated on first run
+      "dashboard_token": "...",            # only needed for non-loopback access
       "dashboard_secure_cookie": false,
       "dashboard_allowed_hosts": [],       # extra Host names (reverse proxy)
       "dashboard_trusted_proxies": [],     # addresses whose X-Forwarded-For counts
