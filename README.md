@@ -231,7 +231,7 @@ Every option is optional, and only the ones you pass are changed.
 |---------|-----|
 | Everything except `setup` and `fixcommands` (announce, schedule, repeat, scheduled, cancel, history, template, poll, ticket, reactionrole, event, welcome, edit, delete, queue, approve, reject, quiet, pins, status, audit) | Holders of the **staff role**, and administrators |
 | `setup`, `fixcommands` | Administrators |
-| The dashboard | Anyone with the dashboard token (see [section 4](#4-the-dashboard)) |
+| The dashboard | Anyone with access to the bot machine or its SSH tunnel (see [section 4](#4-the-dashboard)) |
 
 The check runs again every time a command is used, so a Discord integration
 that shows the commands to more people does not give them access.
@@ -253,17 +253,23 @@ and idle close), reaction roles, role menus and events, set
 welcome messages, change settings, and read the audit log. Every button calls the same code as its command, so the two can
 not drift apart.
 
-### Get the token and sign in
+### Open the dashboard
+
+On the bot machine, open `http://127.0.0.1:8765`. The default loopback-only
+setup does not ask for a dashboard password. To use it remotely, create an SSH
+tunnel from your computer:
 
 ```bash
-python bot.py --dashboard-token
+ssh -L 8765:127.0.0.1:8765 your-user@your-server
 ```
 
-This prints the token, creating one on first use and saving it in
-`data/config.json` (the file is written with owner-only permissions). Open
-`http://127.0.0.1:8765` on the bot's machine and paste it in. The Discord bot
-token does not work on the dashboard, and the dashboard token does not work on
-Discord.
+Then open `http://localhost:8765` in your browser. The dashboard is still
+served only on the server's loopback interface; SSH carries the connection.
+
+If you deliberately bind the dashboard to a non-loopback address (for example,
+behind a reverse proxy), sign-in remains enabled. Run
+`python bot.py --dashboard-token` on the bot machine to print or create that
+token. Do not expose the dashboard port directly to the internet.
 
 ### Settings
 
@@ -272,7 +278,7 @@ Discord.
 | `dashboard_enabled` | `true` | Set to `false` to run the bot without the dashboard. |
 | `dashboard_host` | `127.0.0.1` | Address to listen on. Loopback means only this machine can reach it. |
 | `dashboard_port` | `8765` | Port to listen on. |
-| `dashboard_token` | created on first use | The sign-in token. Change it by editing the file and restarting. |
+| `dashboard_token` | empty | Used for sign-in only when `dashboard_host` is non-loopback. It is generated automatically on first start in that mode. |
 | `dashboard_secure_cookie` | `false` | Set to `true` when the dashboard is served over HTTPS, so the session cookie is only sent over HTTPS. |
 | `dashboard_allowed_hosts` | `[]` | Extra host names the dashboard answers to, e.g. `["staff.example.com"]`. Loopback names are always allowed. Requests with any other `Host` header get a 400. |
 | `dashboard_trusted_proxies` | `[]` | Addresses of reverse proxies, e.g. `["127.0.0.1"]`. Their `X-Forwarded-For` header is used to tell visitors apart for the login throttle. Without this, every visitor looks like the proxy. |
@@ -292,7 +298,7 @@ new is opened on the server, and the port never faces the internet.
 
    `-N` means no remote shell, only the tunnel. Leave the window open while you
    use the dashboard. Windows 10 and later include this `ssh` command.
-3. Open `http://localhost:8765` in your browser and paste the token.
+3. Open `http://localhost:8765` in your browser. No dashboard password is needed for the loopback/SSH setup.
 
 If port 8765 is already in use on your computer, pick another local port, such
 as `-L 9000:127.0.0.1:8765`, and open `http://localhost:9000`. Use `localhost`
@@ -305,8 +311,8 @@ own machine, and SSH carries the traffic to the server.
 
 * The session is an **HttpOnly, SameSite=Strict** cookie. Every change also
   needs an `X-CSRF-Token` header that matches the session.
-* Failed sign-ins are throttled per client address (after 8 failures in 10
-  minutes, sign-in is refused for a while).
+* Sign-in attempts are throttled per client address when token authentication
+  is enabled for a non-loopback bind.
 * The `Host` header must be a name you have allowed (loopback by default). This
   blocks DNS-rebinding attacks.
 * The page sends a strict Content-Security-Policy, and no inline scripts.

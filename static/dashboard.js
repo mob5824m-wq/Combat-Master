@@ -10,6 +10,7 @@
   const state = {
     csrf: null,
     demo: false,
+    loginRequired: true,
     guilds: [],
     guildId: null,
     snapshot: null,
@@ -156,9 +157,9 @@
       data = null;
     }
     if (response.status === 401 && path !== "login") {
-      // Demo mode has no token to type. If its session went stale (the server
-      // restarted or the cookie expired), open a fresh one and retry once.
-      if (state.demo && !retried && path !== "session") {
+      // Passwordless loopback mode and demo mode can renew a session without
+      // prompting. For authenticated remote deployments, show the sign-in form.
+      if ((state.demo || !state.loginRequired) && !retried && path !== "session") {
         const session = await api("session");
         if (session.authenticated) {
           state.csrf = session.csrf;
@@ -191,13 +192,14 @@
   function showApp() {
     $("#login-view").hidden = true;
     $("#app-view").hidden = false;
-    // The demo has no sign-in to return to, so it has no log-out either.
-    $("#logout-btn").hidden = state.demo;
+    // Passwordless loopback and demo sessions renew automatically.
+    $("#logout-btn").hidden = !state.loginRequired || state.demo;
   }
 
   async function boot() {
     const session = await api("session");
     state.demo = Boolean(session.demo);
+    state.loginRequired = Boolean(session.login_required);
     $("#demo-badge").hidden = !state.demo;
     $("#version").textContent = session.version ? `v${session.version}` : "";
     if (session.authenticated) {

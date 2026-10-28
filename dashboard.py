@@ -6,16 +6,16 @@ a JSON API under ``/api``. Every button on the page calls the same
 apart, and every action is recorded in the audit log as ``dashboard``.
 
 Security
-    * The dashboard token is a bot-wide credential. It is generated on first
-      run, kept in ``data/config.json``, and printed by ``--dashboard-token``.
-      The Discord bot token will not work here.
+    * Loopback-bound dashboards have no sign-in prompt: access is limited to
+      the bot machine or an SSH tunnel. A token is generated only if the
+      operator explicitly binds the dashboard beyond loopback.
     * The session is an HttpOnly, SameSite=Strict cookie. Every write also needs
       an ``X-CSRF-Token`` header that matches the session.
     * The ``Host`` header must be a loopback name or one of
       ``dashboard_allowed_hosts``. This blocks DNS rebinding.
-    * Login attempts are throttled per client address. Set
-      ``dashboard_trusted_proxies`` so a reverse proxy's ``X-Forwarded-For``
-      counts; without it every visitor looks like the proxy.
+    * Token sign-in attempts (when enabled for a non-loopback bind) are
+      throttled per client address. Set ``dashboard_trusted_proxies`` so a
+      reverse proxy's ``X-Forwarded-For`` counts.
     * The default bind is 127.0.0.1. Reach it from another machine through an
       SSH tunnel or a reverse proxy that terminates HTTPS.
 """
@@ -113,7 +113,7 @@ class DashboardServer:
         gateway: ops.Gateway,
         config: dict[str, Any],
         *,
-        token: str,
+        token: Optional[str] = None,
         host: str = "127.0.0.1",
         port: int = 8765,
         allowed_hosts: list[str] | tuple[str, ...] = (),
@@ -121,13 +121,19 @@ class DashboardServer:
         secure_cookie: bool = False,
         demo: bool = False,
     ) -> None:
-        if not token:
-            raise ValueError("The dashboard needs a token.")
         self.gateway = gateway
         self.config = config
-        self.token = token
+        # Live installs bound to loopback need no second password: access is
+        # already limited to the bot machine (or an SSH tunnel). Keep token
+        # authentication available for explicitly exposed/reverse-proxied sites.
+        self.token = str(token) if token else None
         self.host = host
         self.port = int(port)
+        if self.token is None and not demo and not self._is_loopback_host(host):
+            raise ValueError(
+                "Passwordless dashboard access is only allowed on loopback. "
+                "Use 127.0.0.1 and an SSH tunnel, or configure a dashboard token."
+            )
         self.secure_cookie = secure_cookie
         self.demo = demo
         self.allowed_hosts = {h.lower() for h in allowed_hosts} | LOOPBACK_NAMES
@@ -274,6 +280,15 @@ class DashboardServer:
                 raise _http(web.HTTPForbidden, "The page is out of date. Reload it and try again.")
         return session
 
+    @staticmethod
+    def _is_loopback_host(host: str) -> bool:
+        if str(host).strip().lower() == "localhost":
+            return True
+        try:
+            return ipaddress.ip_address(str(host).strip()).is_loopback
+        except ValueError:
+            return False
+
     def _parse_networks(self, entries) -> list:
         networks = []
         for entry in entries or ():
@@ -351,16 +366,25 @@ class DashboardServer:
 
     async def _session_info(self, request: web.Request) -> web.Response:
         session = self._session(request)
-        return self._json(
+        sid = None
+        if session is None and self.token is None and not self.demo:
+            sid, session = self._open_session()
+        response = self._json(
             {
                 "authenticated": session is not None,
+                "login_required": self.token is not None and not self.demo,
                 "csrf": session["csrf"] if session else None,
                 "demo": self.demo,
                 "version": paths.app_version(),
             }
         )
+        if sid is not None:
+            self._attach_session(response, sid)
+        return response
 
     async def _login(self, request: web.Request) -> web.Response:
+        if self.token is None:
+            raise _http(web.HTTPNotFound, "Dashboard sign-in is disabled.")
         ip = self._client_ip(request)
         if self._throttled(ip):
             raise _http(web.HTTPTooManyRequests, "Too many attempts. Wait a few minutes and try again.")
