@@ -105,7 +105,7 @@ class ParsingTests(unittest.TestCase):
         self.assertEqual(reaction_roles.parse_emoji("<a:spin:123456789012345678>"), "<a:spin:123456789012345678>")
 
     def test_plain_words_are_not_emoji(self):
-        for text in ("gaming", "yes", ""):
+        for text in ("gaming", "yes", "", ":)", "---", "???"):
             with self.assertRaises(ValueError):
                 reaction_roles.parse_emoji(text)
 

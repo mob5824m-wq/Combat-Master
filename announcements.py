@@ -94,6 +94,8 @@ def parse_send_time(text: str, now: datetime, tz_name: str) -> datetime:
     now = now.astimezone(timezone.utc)
     seconds = parse_duration(text)
     if seconds is not None:
+        if seconds > MAX_SCHEDULE_AHEAD.total_seconds():
+            raise ValueError("Times can be at most 365 days away.")
         target = now + timedelta(seconds=seconds)
     else:
         match = _ABSOLUTE.match(text or "")

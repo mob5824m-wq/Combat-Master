@@ -442,7 +442,7 @@ async def seed_demo(gateway: DemoGateway, cfg: dict[str, Any]) -> None:
     await ops.close_ticket(gateway, cfg, guild_id, staff, int(ticket["id"]), actor_is_staff=True)
 
 
-async def run_demo(host: str = "127.0.0.1", port: int = 8765) -> None:
+async def run_demo(host: str = "127.0.0.1", port: int = settings.DEFAULT_DASHBOARD_PORT) -> None:
     """Serve the dashboard over simulated servers until interrupted."""
     import paths
     from dashboard import DashboardServer
@@ -466,7 +466,8 @@ async def run_demo(host: str = "127.0.0.1", port: int = 8765) -> None:
         demo=True,
     )
     await dashboard.start()
-    print(f"Demo dashboard: http://{host if host != '0.0.0.0' else 'localhost'}:{port}  (no sign-in needed)", flush=True)
+    display_host = "localhost" if host in ("0.0.0.0", "::") else f"[{host}]" if ":" in host and not host.startswith("[") else host
+    print(f"Demo dashboard: http://{display_host}:{port}  (no sign-in needed)", flush=True)
     print(f"Data directory: {paths.data_dir()} (temporary)", flush=True)
     try:
         while True:

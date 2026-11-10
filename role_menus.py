@@ -55,6 +55,8 @@ def embed(title: str, description: str, options: list[dict[str, Any]]) -> discor
     body = description.strip()
     if lines:
         body = (body + "\n\n" if body else "") + "\n".join(lines)
+    if len(body) > 4096:
+        body = body[:4093] + "..."
     return discord.Embed(
         title=title,
         description=body or "Pick the roles you want from the menu below.",
@@ -117,13 +119,20 @@ def count_options(menu_id: int) -> int:
 
 def add_option(menu_id: int, role_id: int, label: str, description: str) -> bool:
     """Add a role. Returns False if the role is already in this menu."""
-    position = count_options(menu_id)
-    changed = store.db_execute(
-        "INSERT OR IGNORE INTO role_menu_options (menu_id, role_id, label, description, position) "
-        "VALUES (?, ?, ?, ?, ?)",
-        (int(menu_id), int(role_id), label, description, position),
-    )
-    return changed > 0
+    def work(conn) -> bool:
+        row = conn.execute(
+            "SELECT COALESCE(MAX(position), -1) + 1 AS next_pos FROM role_menu_options WHERE menu_id = ?",
+            (int(menu_id),),
+        ).fetchone()
+        position = int(row["next_pos"]) if row else 0
+        cur = conn.execute(
+            "INSERT OR IGNORE INTO role_menu_options (menu_id, role_id, label, description, position) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (int(menu_id), int(role_id), label, description, position),
+        )
+        return cur.rowcount > 0
+
+    return store.db_transaction(work)
 
 
 def remove_option(menu_id: int, role_id: int) -> bool:
@@ -141,5 +150,8 @@ def attach_message(menu_id: int, channel_id: int, message_id: int) -> None:
 
 
 def delete_menu(menu_id: int) -> None:
-    store.db_execute("DELETE FROM role_menu_options WHERE menu_id = ?", (int(menu_id),))
-    store.db_execute("DELETE FROM role_menus WHERE id = ?", (int(menu_id),))
+    def work(conn) -> None:
+        conn.execute("DELETE FROM role_menu_options WHERE menu_id = ?", (int(menu_id),))
+        conn.execute("DELETE FROM role_menus WHERE id = ?", (int(menu_id),))
+
+    store.db_transaction(work)

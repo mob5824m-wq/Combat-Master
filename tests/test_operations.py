@@ -272,6 +272,8 @@ class PollTests(OpsTestCase):
     def test_bad_duration_is_refused(self):
         with self.assertRaises(OperationError):
             self.create(duration="31d")
+        with self.assertRaises(OperationError):
+            self.create(duration="99999999999d")
 
 
 class EventTests(OpsTestCase):
@@ -313,6 +315,11 @@ class EventTests(OpsTestCase):
         with self.assertRaises(OperationError):
             run(ops.cancel_event(self.gw, self.cfg, GUILD, STAFF, event["id"]))
 
+    def test_past_reminder_is_skipped_when_event_starts_sooner(self):
+        event = self.create(starts_when="20m", remind_minutes=60)
+        self.assertIsNone(event["reminder_at"])
+        self.assertEqual(self.scheduler(NOW + timedelta(minutes=1))["reminders"], 0)
+
 
 class WelcomeTests(OpsTestCase):
     def test_set_send_and_turn_off(self):
@@ -334,6 +341,9 @@ class WelcomeTests(OpsTestCase):
         run(ops.set_welcome(self.gw, self.cfg, GUILD, STAFF, channel_id=GENERAL, message="Hi {name} from {server}"))
         text = ops.render_for(self.cfg, GUILD, mention="@x", name="Sam", server="Combat", members=3)
         self.assertEqual(text, "Hi Sam from Combat")
+        # Placeholders inside a member's name are not expanded a second time.
+        literal = ops.render_for(self.cfg, GUILD, mention="@x", name="{server}", server="Combat", members=3)
+        self.assertEqual(literal, "Hi {server} from Combat")
 
     def test_blank_message_is_refused(self):
         with self.assertRaises(OperationError):

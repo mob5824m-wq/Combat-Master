@@ -187,6 +187,30 @@ class CloseTicketTests(TicketTestCase):
         with self.assertRaises(OperationError):
             self.close(999, STAFF, staff=True)
 
+    def test_concurrent_open_ticket_does_not_create_two_channels(self):
+        original_create = self.gw.create_ticket_channel
+
+        async def slow_create(*args, **kwargs):
+            await asyncio.sleep(0.02)
+            return await original_create(*args, **kwargs)
+
+        self.gw.create_ticket_channel = slow_create
+
+        async def race():
+            return await asyncio.gather(
+                ops.open_ticket(self.gw, self.cfg, GUILD, MEMBER, now=NOW),
+                ops.open_ticket(self.gw, self.cfg, GUILD, MEMBER, now=NOW),
+                return_exceptions=True,
+            )
+
+        results = run(race())
+        successes = [r for r in results if isinstance(r, dict)]
+        errors = [r for r in results if isinstance(r, OperationError)]
+        self.assertEqual(len(successes), 1)
+        self.assertEqual(len(errors), 1)
+        self.assertEqual(len(self.gw.created_channels), 1)
+        self.assertEqual(len(ops.list_tickets(GUILD, open_only=True)), 1)
+
 
 class LookupTests(TicketTestCase):
     def test_find_ticket_by_channel_only_returns_open_tickets(self):

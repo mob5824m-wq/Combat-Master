@@ -255,15 +255,15 @@ not drift apart.
 
 ### Open the dashboard
 
-On the bot machine, open `http://127.0.0.1:8765`. The default loopback-only
+On the bot machine, open `http://127.0.0.1:8780`. The default loopback-only
 setup does not ask for a dashboard password. To use it remotely, create an SSH
 tunnel from your computer:
 
 ```bash
-ssh -L 8765:127.0.0.1:8765 your-user@your-server
+ssh -L 8780:127.0.0.1:8780 your-user@your-server
 ```
 
-Then open `http://localhost:8765` in your browser. The dashboard is still
+Then open `http://localhost:8780` in your browser. The dashboard is still
 served only on the server's loopback interface; SSH carries the connection.
 
 If you deliberately bind the dashboard to a non-loopback address (for example,
@@ -277,7 +277,7 @@ token. Do not expose the dashboard port directly to the internet.
 |---------------------------|---------|--------------|
 | `dashboard_enabled` | `true` | Set to `false` to run the bot without the dashboard. |
 | `dashboard_host` | `127.0.0.1` | Address to listen on. Loopback means only this machine can reach it. |
-| `dashboard_port` | `8765` | Port to listen on. |
+| `dashboard_port` | `8780` | Port to listen on (distinct from Sentinel's `8765` and Discord Lofi's `8790`). |
 | `dashboard_token` | empty | Used for sign-in only when `dashboard_host` is non-loopback. It is generated automatically on first start in that mode. |
 | `dashboard_secure_cookie` | `false` | Set to `true` when the dashboard is served over HTTPS, so the session cookie is only sent over HTTPS. |
 | `dashboard_allowed_hosts` | `[]` | Extra host names the dashboard answers to, e.g. `["staff.example.com"]`. Loopback names are always allowed. Requests with any other `Host` header get a 400. |
@@ -293,15 +293,15 @@ new is opened on the server, and the port never faces the internet.
    with your SSH login and the server's address:
 
    ```bash
-   ssh -N -L 8765:127.0.0.1:8765 user@server.example.com
+   ssh -N -L 8780:127.0.0.1:8780 user@server.example.com
    ```
 
    `-N` means no remote shell, only the tunnel. Leave the window open while you
    use the dashboard. Windows 10 and later include this `ssh` command.
-3. Open `http://localhost:8765` in your browser. No dashboard password is needed for the loopback/SSH setup.
+3. Open `http://localhost:8780` in your browser. No dashboard password is needed for the loopback/SSH setup.
 
-If port 8765 is already in use on your computer, pick another local port, such
-as `-L 9000:127.0.0.1:8765`, and open `http://localhost:9000`. Use `localhost`
+If port 8780 is already in use on your computer, pick another local port, such
+as `-L 9000:127.0.0.1:8780`, and open `http://localhost:9000`. Use `localhost`
 rather than an IP address, since loopback names are the ones the dashboard
 accepts. You do not need to change `dashboard_allowed_hosts` or
 `dashboard_secure_cookie` for a tunnel. The browser talks plain HTTP to your
@@ -331,7 +331,7 @@ python bot.py --demo
 Discord connection and no real data. Posts, polls, reactions and reminders all
 happen in memory. The database is a temporary directory unless
 `COMBAT_MASTER_DATA` is set. To try it from another machine (for example in a
-preview), add `--host 0.0.0.0 --port 8765`. Do not run demo mode on a real
+preview), add `--host 0.0.0.0 --port 8780`. Do not run demo mode on a real
 install.
 
 ## 5. Times

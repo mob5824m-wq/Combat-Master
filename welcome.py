@@ -13,9 +13,12 @@ The only ping it can make is the new member, through ``{mention}``.
 
 from __future__ import annotations
 
+import re
+
 MAX_TEMPLATE_LENGTH = 1000
 DEFAULT_WELCOME_MESSAGE = "Welcome to **{server}**, {mention}! You are member #{members}."
 PLACEHOLDERS = ("{mention}", "{name}", "{server}", "{members}")
+_PLACEHOLDER_RE = re.compile(r"\{(?:mention|name|server|members)\}")
 
 
 def clean_template(text: str | None) -> str:
@@ -43,6 +46,5 @@ def render_welcome(
         "{server}": server,
         "{members}": str(members),
     }
-    for placeholder, value in values.items():
-        text = text.replace(placeholder, value)
+    text = _PLACEHOLDER_RE.sub(lambda match: values[match.group(0)], text)
     return text[:2000]
