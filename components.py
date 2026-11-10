@@ -38,6 +38,17 @@ STYLES = {
 # --------------------------------------------------------------------------- #
 # Replies
 # --------------------------------------------------------------------------- #
+async def _defer(interaction: discord.Interaction) -> bool:
+    """Defer ephemerally before slow Discord calls so the 3-second deadline does not expire."""
+    try:
+        if not interaction.response.is_done():
+            await interaction.response.defer(ephemeral=True)
+        return True
+    except discord.HTTPException as exc:
+        logger.warning("Could not acknowledge a button press: %s", exc)
+        return False
+
+
 async def _reply(interaction: discord.Interaction, text: str) -> None:
     """Ephemeral answer. Defers first so a slow operation can not time the press out."""
     try:
@@ -63,6 +74,8 @@ async def handle_vote(interaction: discord.Interaction, poll_id: int, index: int
     if interaction.guild_id is None:
         await _reply(interaction, "Votes only count inside a server.")
         return
+    if not await _defer(interaction):
+        return
     bot = _bot(interaction)
     try:
         result = await ops.cast_vote(bot.gateway, bot.config, interaction.guild_id, poll_id, _actor(interaction), index)
@@ -84,6 +97,8 @@ async def handle_ticket_open(interaction: discord.Interaction) -> None:
     if interaction.guild_id is None:
         await _reply(interaction, "Tickets can only be opened inside a server.")
         return
+    if not await _defer(interaction):
+        return
     bot = _bot(interaction)
     try:
         result = await ops.open_ticket(bot.gateway, bot.config, interaction.guild_id, _actor(interaction))
@@ -96,6 +111,8 @@ async def handle_ticket_open(interaction: discord.Interaction) -> None:
 async def handle_ticket_close(interaction: discord.Interaction) -> None:
     if interaction.guild_id is None or interaction.channel_id is None:
         await _reply(interaction, "This button only works inside a ticket.")
+        return
+    if not await _defer(interaction):
         return
     bot = _bot(interaction)
     ticket = ops.find_ticket_by_channel(interaction.guild_id, interaction.channel_id)
@@ -124,6 +141,8 @@ async def handle_ticket_close(interaction: discord.Interaction) -> None:
 async def handle_role_menu(interaction: discord.Interaction, menu_id: int, picked: list[str]) -> None:
     if interaction.guild_id is None:
         await _reply(interaction, "Role menus only work inside a server.")
+        return
+    if not await _defer(interaction):
         return
     bot = _bot(interaction)
     held = [role.id for role in getattr(interaction.user, "roles", [])]

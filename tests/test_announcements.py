@@ -56,6 +56,8 @@ class SendTimeTests(unittest.TestCase):
             ann.parse_send_time("2026-10-16 12:00", NOW, "UTC")
         with self.assertRaises(ValueError):
             ann.parse_send_time("400d", NOW, "UTC")
+        with self.assertRaises(ValueError):
+            ann.parse_send_time("99999999999d", NOW, "UTC")
 
     def test_nonexistent_date_is_refused(self):
         with self.assertRaises(ValueError):

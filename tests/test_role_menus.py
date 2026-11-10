@@ -178,6 +178,23 @@ class MenuBuildingTests(RoleMenuTestCase):
         with self.assertRaises(OperationError):
             run(ops.remove_role_menu_option(self.gw, self.cfg, GUILD, STAFF, menu_id=menu["id"], role_id=MEMBER_ROLE))
 
+    def test_readding_after_removal_keeps_later_roles_at_the_end(self):
+        guild = copy.deepcopy(DEMO_GUILDS[0])
+        guild["roles"] = [(100000000000000300 + i, f"Role {i}", True) for i in range(4)]
+        self.gw = DemoGateway(guilds=[guild])
+        menu = self.new_menu()
+        r0, r1, r2, r3 = [100000000000000300 + i for i in range(4)]
+        for rid in (r0, r1, r2):
+            self.add(menu["id"], rid)
+        run(ops.remove_role_menu_option(self.gw, self.cfg, GUILD, STAFF, menu_id=menu["id"], role_id=r1))
+        self.add(menu["id"], r3)
+        self.assertEqual([o["role_id"] for o in role_menus.options_for(menu["id"])], [r0, r2, r3])
+
+    def test_embed_clamps_long_25_role_menus_within_discord_limit(self):
+        long_options = [{"label": "A" * 100, "description": "B" * 100} for _ in range(25)]
+        embed = role_menus.embed("Roles", "C" * 1000, long_options)
+        self.assertLessEqual(len(embed.description), 4096)
+
     def test_a_missing_menu_is_refused(self):
         with self.assertRaises(OperationError):
             self.add(999, MEMBER_ROLE)

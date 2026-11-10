@@ -29,6 +29,7 @@ import audit  # noqa: E402
 import paths  # noqa: E402
 import store  # noqa: E402
 from dashboard import (  # noqa: E402
+    DEFAULT_PORT,
     LOGIN_MAX_FAILURES,
     SESSION_COOKIE,
     DashboardServer,
@@ -62,7 +63,7 @@ class DashboardTestCase(unittest.TestCase):
         self._tmp.cleanup()
 
     def make_server(self, **overrides) -> DashboardServer:
-        options = {"token": TOKEN, "host": "127.0.0.1", "port": 8765}
+        options = {"token": TOKEN, "host": "127.0.0.1", "port": DEFAULT_PORT}
         options.update(overrides)
         return DashboardServer(self.gw, self.cfg, **options)
 
@@ -736,6 +737,107 @@ class UpkeepRouteTests(DashboardTestCase):
                 f"api/guilds/{GUILD}/settings", json={"ticket_auto_close_days": 900}, headers=headers
             )
             self.assertEqual(bad.status, 400)
+        self.run_with(scenario)
+
+
+class DashboardPortAndValidationTests(DashboardTestCase):
+    def test_default_dashboard_url_is_distinct_from_sentinel_and_discord_lofi(self):
+        import inspect
+        import demo as demo_module
+
+        template = json.loads((REPO_ROOT / "config.json").read_text(encoding="utf-8"))
+        self.assertEqual(template["dashboard_port"], 8780)
+        self.assertEqual(settings.DEFAULT_DASHBOARD_PORT, 8780)
+        self.assertEqual(settings.DEFAULT_CONFIG["dashboard_port"], 8780)
+        self.assertEqual(DEFAULT_PORT, 8780)
+        self.assertEqual(inspect.signature(demo_module.run_demo).parameters["port"].default, 8780)
+        self.assertEqual(inspect.signature(DashboardServer.__init__).parameters["port"].default, 8780)
+        self.assertNotIn(DEFAULT_PORT, (8765, 8790))
+
+    def test_invalid_port_and_ipv6_loopback_validation(self):
+        with self.assertRaises(ValueError):
+            self.make_server(port=0)
+        with self.assertRaises(ValueError):
+            self.make_server(port=65536)
+        self.assertTrue(DashboardServer._is_loopback_host("[::1]"))
+        self.assertTrue(DashboardServer._is_loopback_host("::1"))
+        self.assertFalse(DashboardServer._is_loopback_host("0.0.0.0"))
+
+    def test_head_requests_do_not_require_csrf_token(self):
+        async def scenario(client):
+            _, _, cookie = await login(client)
+            head = await client.head("/api/guilds", headers=auth_headers(cookie))
+            self.assertEqual(head.status, 200)
+        self.run_with(scenario)
+
+    def test_malformed_json_types_and_missing_fields_return_400_instead_of_500(self):
+        async def scenario(client):
+            _, body, cookie = await login(client)
+            headers = auth_headers(cookie, body["csrf"])
+
+            bad_requests = [
+                ("POST", f"api/guilds/{GUILD}/announce", {"message": "Hi", "title": 123, "channel_id": ANNOUNCE}),
+                ("POST", f"api/guilds/{GUILD}/announce", {"message": "Hi", "channel_id": True}),
+                ("POST", f"api/guilds/{GUILD}/scheduled", {"when": "99999999999d", "message": "Hi", "channel_id": ANNOUNCE}),
+                ("POST", f"api/guilds/{GUILD}/scheduled", {"when": "2h", "message": "Hi", "repeat_every": 123, "channel_id": ANNOUNCE}),
+                ("POST", f"api/guilds/{GUILD}/polls", {"question": "Q?", "options": 123, "channel_id": ANNOUNCE}),
+                ("POST", f"api/guilds/{GUILD}/polls", {"question": "Q?", "options": ["A", "B"], "duration": "99999999999d", "channel_id": ANNOUNCE}),
+                ("POST", f"api/guilds/{GUILD}/reaction-roles", {"message": "123", "emoji": "🎮", "channel_id": ANNOUNCE}),
+                ("PUT", f"api/guilds/{GUILD}/settings", {"staff_role_id": True}),
+                ("PUT", f"api/guilds/{GUILD}/settings", {"staff_role_id": [1]}),
+                ("PUT", f"api/guilds/{GUILD}/settings", {"ticket_auto_close_days": True}),
+                ("PUT", f"api/guilds/{GUILD}/settings", {"timezone": ["UTC"]}),
+            ]
+            for method, path, payload in bad_requests:
+                resp = await client.request(method, path, json=payload, headers=headers)
+                self.assertEqual(resp.status, 400, f"{method} {path} with {payload} returned {resp.status}")
+
+            menu = await (await client.post(
+                f"api/guilds/{GUILD}/role-menus", json={"title": "Roles"}, headers=headers
+            )).json()
+            missing_role = await client.post(
+                f"api/guilds/{GUILD}/role-menus/{menu['id']}/options",
+                json={"label": "Member"},
+                headers=headers,
+            )
+            self.assertEqual(missing_role.status, 400)
+            bad_label = await client.post(
+                f"api/guilds/{GUILD}/role-menus/{menu['id']}/options",
+                json={"role_id": "100000000000000202", "label": ["Member"]},
+                headers=headers,
+            )
+            self.assertEqual(bad_label.status, 400)
+        self.run_with(scenario)
+
+    def test_welcome_null_message_resets_to_default_while_whitespace_is_refused(self):
+        async def scenario(client):
+            _, body, cookie = await login(client)
+            headers = auth_headers(cookie, body["csrf"])
+
+            saved = await client.post(
+                f"api/guilds/{GUILD}/welcome",
+                json={"channel_id": GENERAL, "message": "Custom hello {mention}!"},
+                headers=headers,
+            )
+            self.assertEqual(saved.status, 200)
+            self.assertEqual((await saved.json())["message"], "Custom hello {mention}!")
+
+            blank = await client.post(
+                f"api/guilds/{GUILD}/welcome",
+                json={"channel_id": GENERAL, "message": "   "},
+                headers=headers,
+            )
+            self.assertEqual(blank.status, 400)
+
+            cleared = await client.post(
+                f"api/guilds/{GUILD}/welcome",
+                json={"channel_id": GENERAL, "message": None},
+                headers=headers,
+            )
+            self.assertEqual(cleared.status, 200)
+            self.assertIn("Welcome to **{server}**", (await cleared.json())["message"])
+            current = await (await client.get(f"api/guilds/{GUILD}/settings", headers=auth_headers(cookie))).json()
+            self.assertIsNone(current["welcome_message"])
         self.run_with(scenario)
 
 

@@ -7,7 +7,7 @@ Config shape (``data/config.json``)::
       "default_timezone": "America/Toronto",
       "dashboard_enabled": true,
       "dashboard_host": "127.0.0.1",
-      "dashboard_port": 8765,
+      "dashboard_port": 8780,
       "dashboard_token": "...",            # only needed for non-loopback access
       "dashboard_secure_cookie": false,
       "dashboard_allowed_hosts": [],       # extra Host names (reverse proxy)
@@ -44,13 +44,15 @@ import paths
 logger = logging.getLogger("combat_master.settings")
 
 DEFAULT_TIMEZONE = "America/Toronto"
+# Chosen to stay distinct from sibling bots (Sentinel uses 8765, Discord Lofi uses 8790).
+DEFAULT_DASHBOARD_PORT = 8780
 
 DEFAULT_CONFIG: dict[str, Any] = {
     "bot_token": "",
     "default_timezone": DEFAULT_TIMEZONE,
     "dashboard_enabled": True,
     "dashboard_host": "127.0.0.1",
-    "dashboard_port": 8765,
+    "dashboard_port": DEFAULT_DASHBOARD_PORT,
     "dashboard_token": "",
     "dashboard_secure_cookie": False,
     "dashboard_allowed_hosts": [],

@@ -41,6 +41,11 @@ POLL_MIN_DURATION = timedelta(minutes=1)
 POLL_MAX_DURATION = timedelta(days=30)
 MAX_AUTO_CLOSE_DAYS = 365
 
+# In-process guards against concurrent button presses / scheduler ticks.
+_OPENING_TICKETS: set[tuple[int, int]] = set()
+_CLOSING_TICKETS: set[int] = set()
+_CLOSING_POLLS: set[int] = set()
+
 
 class OperationError(Exception):
     """A problem to show the staff member, worded for them."""
@@ -818,11 +823,12 @@ async def create_poll(
     text = polls.clean_question(question)
     choices = polls.parse_options(options)
     seconds = None
-    if duration:
-        seconds = ann.parse_duration(duration)
+    duration_text = (duration or "").strip() if isinstance(duration, str) else duration
+    if duration_text:
+        seconds = ann.parse_duration(duration_text)
         if seconds is None:
             raise ValueError("I could not read that duration. Use something like `1h` or `2d`.")
-        if timedelta(seconds=seconds) < POLL_MIN_DURATION or timedelta(seconds=seconds) > POLL_MAX_DURATION:
+        if seconds < POLL_MIN_DURATION.total_seconds() or seconds > POLL_MAX_DURATION.total_seconds():
             raise ValueError("A poll must run between 1 minute and 30 days.")
     when = None
     if send_at:
@@ -974,46 +980,54 @@ async def cast_vote(
 
 
 async def _finish_poll(gw: Gateway, cfg: dict, poll: dict[str, Any], actor: Actor, now: datetime) -> dict[str, Any]:
-    guild_id, channel_id = poll["guild_id"], poll["channel_id"]
-    options = poll["options"]
-    voters: Optional[int] = None
-    if poll["mode"] == polls.MODE_BUTTONS:
-        votes, voters = polls.tally(poll["id"], len(options))
-        embed = polls.build_poll_embed(
-            question=poll["question"],
-            options=options,
-            votes=votes,
-            voters=voters,
-            closed=True,
-            mode=polls.MODE_BUTTONS,
-            multiple=poll["multiple"],
-        )
-        clear_view = True
-    else:
-        # A poll from before buttons: the votes are the reactions on its message.
-        emojis = polls.EMOJIS[: len(options)]
-        try:
-            raw = await gw.reaction_counts(guild_id, channel_id, poll["message_id"], emojis)
-        except OperationError as exc:
-            # The poll message was deleted. Close the poll with no votes rather than retry forever.
-            logger.warning("Could not read poll #%s votes (%s); closing it with zero votes.", poll["id"], exc)
-            raw = [1] * len(emojis)
-        votes = polls.votes_from_reactions(raw)
-        embed = polls.build_poll_embed(question=poll["question"], options=options, votes=votes, closed=True)
-        clear_view = False
+    poll_id = int(poll["id"])
+    if poll_id in _CLOSING_POLLS:
+        raise OperationError(f"Poll #{poll_id} is already closing.")
+    _CLOSING_POLLS.add(poll_id)
     try:
-        await gw.edit_embed(guild_id, channel_id, poll["message_id"], embed, clear_view=clear_view)
-    except OperationError as exc:
-        logger.warning("Could not update poll #%s message: %s", poll["id"], exc)
-    polls.mark_closed(poll["id"], votes, now)
-    audit.record(guild_id, actor, "poll.close", f"#{poll['id']}: {poll['question']}")
-    return {
-        "id": poll["id"],
-        "question": poll["question"],
-        "options": options,
-        "votes": votes,
-        "voters": voters,
-    }
+        guild_id, channel_id = poll["guild_id"], poll["channel_id"]
+        options = poll["options"]
+        voters: Optional[int] = None
+        if poll["mode"] == polls.MODE_BUTTONS:
+            votes, voters = polls.tally(poll_id, len(options))
+            embed = polls.build_poll_embed(
+                question=poll["question"],
+                options=options,
+                votes=votes,
+                voters=voters,
+                closed=True,
+                mode=polls.MODE_BUTTONS,
+                multiple=poll["multiple"],
+            )
+            clear_view = True
+        else:
+            # A poll from before buttons: the votes are the reactions on its message.
+            emojis = polls.EMOJIS[: len(options)]
+            try:
+                raw = await gw.reaction_counts(guild_id, channel_id, poll["message_id"], emojis)
+            except OperationError as exc:
+                # The poll message was deleted. Close the poll with no votes rather than retry forever.
+                logger.warning("Could not read poll #%s votes (%s); closing it with zero votes.", poll_id, exc)
+                raw = [1] * len(emojis)
+            votes = polls.votes_from_reactions(raw)
+            embed = polls.build_poll_embed(question=poll["question"], options=options, votes=votes, closed=True)
+            clear_view = False
+        try:
+            await gw.edit_embed(guild_id, channel_id, poll["message_id"], embed, clear_view=clear_view)
+        except OperationError as exc:
+            logger.warning("Could not update poll #%s message: %s", poll_id, exc)
+        if not polls.mark_closed(poll_id, votes, now):
+            raise OperationError(f"Poll #{poll_id} is already closed.")
+        audit.record(guild_id, actor, "poll.close", f"#{poll_id}: {poll['question']}")
+        return {
+            "id": poll_id,
+            "question": poll["question"],
+            "options": options,
+            "votes": votes,
+            "voters": voters,
+        }
+    finally:
+        _CLOSING_POLLS.discard(poll_id)
 
 
 @_user_errors
@@ -1023,7 +1037,8 @@ async def close_poll(gw: Gateway, cfg: dict, guild_id: int, actor: Actor, poll_i
         raise OperationError(f"There is no poll #{poll_id} in this server.")
     if poll["status"] == "scheduled":
         # Not posted yet, so there is nothing to close: cancel it instead.
-        polls.set_status(poll_id, "cancelled", only_from="scheduled")
+        if not polls.set_status(poll_id, "cancelled", only_from="scheduled"):
+            raise OperationError(f"Poll #{poll_id} is no longer scheduled.")
         audit.record(guild_id, actor, "poll.cancel", f"#{poll_id}: {poll['question']}")
         return {"id": poll_id, "question": poll["question"], "cancelled": True, "options": poll["options"], "votes": [], "voters": None}
     if poll["status"] != "open":
@@ -1080,42 +1095,49 @@ def find_ticket_by_channel(guild_id: int, channel_id: int) -> Optional[dict[str,
 
 async def open_ticket(gw: Gateway, cfg: dict, guild_id: int, actor: Actor, *, now: Optional[datetime] = None) -> dict[str, Any]:
     now = _now(now)
-    existing = tickets.open_for_user(guild_id, actor.id)
-    if existing is not None:
-        raise OperationError(f"You already have ticket #{existing['id']} open: <#{existing['channel_id']}>.")
-    category_id = settings.get_ticket_category_id(cfg, guild_id)
-    staff_role_id = settings.get_staff_role_id(cfg, guild_id)
-    channel_id = await gw.create_ticket_channel(
-        guild_id,
-        name=tickets.channel_name(actor.name),
-        opener_id=actor.id,
-        category_id=category_id,
-        staff_role_id=staff_role_id,
-        reason=f"Ticket opened by {actor.name}",
-    )
-    ticket_id = tickets.create(guild_id, channel_id, actor.id, actor.name, now)
-    mentions = f"<@{actor.id}>" + (f" <@&{staff_role_id}>" if staff_role_id else "")
+    key = (int(guild_id), int(actor.id))
+    if key in _OPENING_TICKETS:
+        raise OperationError("Your ticket is already being opened.")
+    _OPENING_TICKETS.add(key)
     try:
-        await gw.post(
+        existing = tickets.open_for_user(guild_id, actor.id)
+        if existing is not None:
+            raise OperationError(f"You already have ticket #{existing['id']} open: <#{existing['channel_id']}>.")
+        category_id = settings.get_ticket_category_id(cfg, guild_id)
+        staff_role_id = settings.get_staff_role_id(cfg, guild_id)
+        channel_id = await gw.create_ticket_channel(
             guild_id,
-            channel_id,
-            embed=tickets.welcome_embed(actor.name, ticket_id),
-            content=mentions,
-            role_id=staff_role_id,
-            user_ids=(actor.id,),
-            view=tickets.close_buttons(),
+            name=tickets.channel_name(actor.name),
+            opener_id=actor.id,
+            category_id=category_id,
+            staff_role_id=staff_role_id,
+            reason=f"Ticket opened by {actor.name}",
         )
-    except Exception as exc:  # the ticket exists even if its greeting did not post
-        logger.warning("Ticket #%s opened without its greeting: %s", ticket_id, exc)
-    embed = discord.Embed(
-        title=f"Ticket #{ticket_id} opened",
-        description=f"{actor.name} opened <#{channel_id}>.",
-        color=discord.Color.blurple(),
-        timestamp=now,
-    )
-    await _log(gw, cfg, guild_id, embed)
-    audit.record(guild_id, actor, "ticket.open", f"#{ticket_id} in channel {channel_id}")
-    return {"id": ticket_id, "channel_id": str(channel_id)}
+        ticket_id = tickets.create(guild_id, channel_id, actor.id, actor.name, now)
+        mentions = f"<@{actor.id}>" + (f" <@&{staff_role_id}>" if staff_role_id else "")
+        try:
+            await gw.post(
+                guild_id,
+                channel_id,
+                embed=tickets.welcome_embed(actor.name, ticket_id),
+                content=mentions,
+                role_id=staff_role_id,
+                user_ids=(actor.id,),
+                view=tickets.close_buttons(),
+            )
+        except Exception as exc:  # the ticket exists even if its greeting did not post
+            logger.warning("Ticket #%s opened without its greeting: %s", ticket_id, exc)
+        embed = discord.Embed(
+            title=f"Ticket #{ticket_id} opened",
+            description=f"{actor.name} opened <#{channel_id}>.",
+            color=discord.Color.blurple(),
+            timestamp=now,
+        )
+        await _log(gw, cfg, guild_id, embed)
+        audit.record(guild_id, actor, "ticket.open", f"#{ticket_id} in channel {channel_id}")
+        return {"id": ticket_id, "channel_id": str(channel_id)}
+    finally:
+        _OPENING_TICKETS.discard(key)
 
 
 async def close_ticket(
@@ -1130,41 +1152,49 @@ async def close_ticket(
 ) -> dict[str, Any]:
     """Delete the ticket's channel and record the close. Only staff or the opener may close it."""
     now = _now(now)
-    ticket = tickets.get(guild_id, ticket_id)
-    if ticket is None:
-        raise OperationError(f"There is no ticket #{ticket_id} in this server.")
-    if ticket["status"] != "open":
-        raise OperationError(f"Ticket #{ticket_id} is already closed.")
-    if not actor_is_staff and int(actor.id) != int(ticket["opener_id"]):
-        raise OperationError("Only the person who opened this ticket, or staff, can close it.")
-    # Read and keep the conversation before the channel goes. A failed read still lets the close go ahead.
-    text, count = await _read_transcript(gw, guild_id, ticket["channel_id"])
-    if text is not None:
-        tickets.save_transcript(guild_id, ticket_id, text, count, now)
-    await gw.delete_channel(guild_id, ticket["channel_id"], reason=f"Ticket #{ticket_id} closed by {actor.name}")
-    tickets.mark_closed(ticket_id, actor.name, now)
-    if text is not None:
-        saved = f"{count} message{'s' if count != 1 else ''} saved for staff."
-    else:
-        saved = "No transcript: the channel could not be read."
-    embed = discord.Embed(
-        title=f"Ticket #{ticket_id} closed",
-        description=f"Opened by {ticket['opener_name'] or 'a member'}, closed by {actor.name}. {saved}",
-        color=discord.Color.greyple(),
-        timestamp=now,
-    )
-    await _log(gw, cfg, guild_id, embed)
-    if text is not None:
-        await _log_file(
-            gw,
-            cfg,
-            guild_id,
-            content=f"Transcript of ticket #{ticket_id} ({count} message{'s' if count != 1 else ''}).",
-            filename=f"ticket-{ticket_id}.txt",
-            data=text.encode("utf-8"),
+    ticket_key = int(ticket_id)
+    if ticket_key in _CLOSING_TICKETS:
+        raise OperationError(f"Ticket #{ticket_id} is already closing.")
+    _CLOSING_TICKETS.add(ticket_key)
+    try:
+        ticket = tickets.get(guild_id, ticket_id)
+        if ticket is None:
+            raise OperationError(f"There is no ticket #{ticket_id} in this server.")
+        if ticket["status"] != "open":
+            raise OperationError(f"Ticket #{ticket_id} is already closed.")
+        if not actor_is_staff and int(actor.id) != int(ticket["opener_id"]):
+            raise OperationError("Only the person who opened this ticket, or staff, can close it.")
+        # Read and keep the conversation before the channel goes. A failed read still lets the close go ahead.
+        text, count = await _read_transcript(gw, guild_id, ticket["channel_id"])
+        if text is not None:
+            tickets.save_transcript(guild_id, ticket_id, text, count, now)
+        await gw.delete_channel(guild_id, ticket["channel_id"], reason=f"Ticket #{ticket_id} closed by {actor.name}")
+        if not tickets.mark_closed(ticket_id, actor.name, now):
+            raise OperationError(f"Ticket #{ticket_id} is already closed.")
+        if text is not None:
+            saved = f"{count} message{'s' if count != 1 else ''} saved for staff."
+        else:
+            saved = "No transcript: the channel could not be read."
+        embed = discord.Embed(
+            title=f"Ticket #{ticket_id} closed",
+            description=f"Opened by {ticket['opener_name'] or 'a member'}, closed by {actor.name}. {saved}",
+            color=discord.Color.greyple(),
+            timestamp=now,
         )
-    audit.record(guild_id, actor, "ticket.close", f"#{ticket_id}")
-    return {"id": ticket_id, "channel_id": str(ticket["channel_id"]), "opener_name": ticket["opener_name"]}
+        await _log(gw, cfg, guild_id, embed)
+        if text is not None:
+            await _log_file(
+                gw,
+                cfg,
+                guild_id,
+                content=f"Transcript of ticket #{ticket_id} ({count} message{'s' if count != 1 else ''}).",
+                filename=f"ticket-{ticket_id}.txt",
+                data=text.encode("utf-8"),
+            )
+        audit.record(guild_id, actor, "ticket.close", f"#{ticket_id}")
+        return {"id": ticket_id, "channel_id": str(ticket["channel_id"]), "opener_name": ticket["opener_name"]}
+    finally:
+        _CLOSING_TICKETS.discard(ticket_key)
 
 
 async def _read_transcript(gw: Gateway, guild_id: int, channel_id: int) -> tuple[Optional[str], int]:
@@ -1194,6 +1224,9 @@ def get_ticket_transcript(guild_id: int, ticket_id: int) -> dict[str, Any]:
 async def _close_idle_tickets(gw: Gateway, cfg: dict, now: datetime, counts: dict[str, int]) -> None:
     """Close open tickets with no message for longer than the server's auto-close setting."""
     for ticket in tickets.list_open_all():
+        ticket_id = int(ticket["id"])
+        if ticket_id in _CLOSING_TICKETS:
+            continue
         guild_id = int(ticket["guild_id"])
         days = settings.get_ticket_auto_close_days(cfg, guild_id)
         if days <= 0 or tickets.last_activity(ticket) > now - timedelta(days=days):
@@ -1204,7 +1237,7 @@ async def _close_idle_tickets(gw: Gateway, cfg: dict, now: datetime, counts: dic
             logger.warning("Could not post the idle notice in ticket #%s: %s", ticket["id"], exc)
         try:
             await close_ticket(
-                gw, cfg, guild_id, SCHEDULER_ACTOR, int(ticket["id"]), actor_is_staff=True, now=now
+                gw, cfg, guild_id, SCHEDULER_ACTOR, ticket_id, actor_is_staff=True, now=now
             )
             counts["tickets_closed"] += 1
         except Exception:
@@ -1493,6 +1526,10 @@ async def create_event(
     starts_at = ann.parse_send_time(starts_when, now, settings.get_timezone_name(cfg, guild_id))
     events.check_start_time(starts_at, now)
     remind = events.clean_remind_minutes(remind_minutes)
+    if remind is not None:
+        remind_at = events.reminder_time(starts_at, remind)
+        if remind_at is not None and remind_at <= now:
+            remind = None
     target = _require_channel(gw, cfg, guild_id, channel_id)
     embed = events.build_event_embed(
         title=heading, description=details, starts_at=starts_at, author_name=actor.name, going=0
@@ -1528,7 +1565,8 @@ async def cancel_event(gw: Gateway, cfg: dict, guild_id: int, actor: Actor, even
     event = events.get_event(guild_id, event_id)
     if event is None or event["status"] != "open":
         raise OperationError(f"There is no open event #{event_id} in this server.")
-    events.cancel_event(guild_id, event_id)
+    if not events.cancel_event(guild_id, event_id):
+        raise OperationError(f"There is no open event #{event_id} in this server.")
     embed = events.build_event_embed(
         title=event["title"],
         description=event["description"],
@@ -1570,12 +1608,15 @@ async def set_welcome(
     *,
     channel_id: int,
     message: Optional[str] = None,
+    clear_message: bool = False,
 ) -> dict[str, Any]:
     problem = gw.channel_problem(guild_id, int(channel_id))
     if problem:
         raise OperationError(problem)
     settings.set_guild_value(cfg, guild_id, "welcome_channel_id", int(channel_id))
-    if message is not None:
+    if clear_message:
+        settings.set_guild_value(cfg, guild_id, "welcome_message", None)
+    elif message is not None:
         settings.set_guild_value(cfg, guild_id, "welcome_message", welcome.clean_template(message))
     _persist(cfg)
     audit.record(guild_id, actor, "welcome.set", f"#{channel_id}")
@@ -1676,6 +1717,8 @@ def _as_flag(value: Any) -> bool:
 def _as_days(value: Any) -> int:
     if value is None or (isinstance(value, str) and value.strip() == ""):
         return 0
+    if isinstance(value, (bool, float)):
+        raise ValueError("Auto-close must be a whole number of days, or 0 for never.")
     try:
         days = int(value)
     except (TypeError, ValueError):
@@ -1692,14 +1735,27 @@ def _clean_setting(gw: Gateway, guild_id: int, key: str, value: Any) -> Any:
         return _as_days(value)
     if _is_blank(value):
         value = None
-    if key == "timezone" and value:
-        return ann.validate_timezone(str(value))
-    if key == "welcome_message" and value:
-        return welcome.clean_template(str(value))
-    if key in ("quiet_start", "quiet_end") and value:
-        return quiet.parse_clock(str(value))
+    if key == "timezone" and value is not None:
+        if not isinstance(value, str):
+            raise ValueError("Timezone must be text, such as `America/Toronto`.")
+        return ann.validate_timezone(value)
+    if key == "welcome_message" and value is not None:
+        if not isinstance(value, str):
+            raise ValueError("Welcome message must be text.")
+        return welcome.clean_template(value)
+    if key in ("quiet_start", "quiet_end") and value is not None:
+        if not isinstance(value, str):
+            raise ValueError("Quiet hour time must be 24-hour text, such as `22:00`.")
+        return quiet.parse_clock(value)
     if key.endswith("_id") and value is not None:
-        value = int(value)
+        if isinstance(value, (bool, float)):
+            raise ValueError(f"`{key}` must be an ID.")
+        try:
+            value = int(value)
+        except (TypeError, ValueError):
+            raise ValueError(f"`{key}` must be an ID.") from None
+        if value <= 0:
+            raise ValueError(f"`{key}` must be a positive ID.")
         if key in ("announcement_channel_id", "staff_channel_id", "welcome_channel_id"):
             problem = gw.channel_problem(guild_id, value)
             if problem:

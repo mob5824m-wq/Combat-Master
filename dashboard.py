@@ -53,6 +53,7 @@ SESSION_COOKIE = "cm_session"
 SESSION_TTL_SECONDS = 12 * 60 * 60
 LOGIN_WINDOW_SECONDS = 10 * 60
 LOGIN_MAX_FAILURES = 8
+DEFAULT_PORT = settings.DEFAULT_DASHBOARD_PORT  # distinct from Sentinel (8765) and Discord Lofi (8790)
 LOOPBACK_NAMES = frozenset({"localhost", "127.0.0.1", "::1"})
 MAX_BODY_BYTES = 64 * 1024
 CONTENT_SECURITY_POLICY = (
@@ -95,12 +96,41 @@ def _http(cls, message: str):
 
 
 def _as_int(value: Any, field: str) -> Optional[int]:
-    if value in (None, ""):
+    if value is None:
         return None
+    if isinstance(value, str):
+        value = value.strip()
+        if not value:
+            return None
+    if isinstance(value, (bool, float)):
+        raise OperationError(f"`{field}` must be a number.")
     try:
         return int(value)
     except (TypeError, ValueError):
         raise OperationError(f"`{field}` must be a number.") from None
+
+
+def _require_int(value: Any, field: str, message: Optional[str] = None) -> int:
+    parsed = _as_int(value, field)
+    if parsed is None:
+        raise OperationError(message or f"`{field}` is required.")
+    return parsed
+
+
+def _opt_str(value: Any, field: str) -> Optional[str]:
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise OperationError(f"`{field}` must be text.")
+    return value if value.strip() else None
+
+
+def _req_str(value: Any, field: str) -> str:
+    if value is None:
+        return ""
+    if not isinstance(value, str):
+        raise OperationError(f"`{field}` must be text.")
+    return value
 
 
 def _as_bool(value: Any) -> bool:
@@ -115,7 +145,7 @@ class DashboardServer:
         *,
         token: Optional[str] = None,
         host: str = "127.0.0.1",
-        port: int = 8765,
+        port: int = DEFAULT_PORT,
         allowed_hosts: list[str] | tuple[str, ...] = (),
         trusted_proxies: list[str] | tuple[str, ...] = (),
         secure_cookie: bool = False,
@@ -129,6 +159,8 @@ class DashboardServer:
         self.token = str(token) if token else None
         self.host = host
         self.port = int(port)
+        if not 1 <= self.port <= 65535:
+            raise ValueError("dashboard_port must be between 1 and 65535.")
         if self.token is None and not demo and not self._is_loopback_host(host):
             raise ValueError(
                 "Passwordless dashboard access is only allowed on loopback. "
@@ -274,7 +306,7 @@ class DashboardServer:
         session = self._session(request)
         if session is None:
             raise _http(web.HTTPUnauthorized, "Log in with the dashboard token first.")
-        if request.method != "GET":
+        if request.method not in ("GET", "HEAD"):
             supplied = request.headers.get("X-CSRF-Token", "")
             if not hmac.compare_digest(supplied.encode(), session["csrf"].encode()):
                 raise _http(web.HTTPForbidden, "The page is out of date. Reload it and try again.")
@@ -282,10 +314,13 @@ class DashboardServer:
 
     @staticmethod
     def _is_loopback_host(host: str) -> bool:
-        if str(host).strip().lower() == "localhost":
+        name = str(host or "").strip().lower()
+        if name.startswith("[") and name.endswith("]"):
+            name = name[1:-1]
+        if name == "localhost":
             return True
         try:
-            return ipaddress.ip_address(str(host).strip()).is_loopback
+            return ipaddress.ip_address(name).is_loopback
         except ValueError:
             return False
 
@@ -389,8 +424,8 @@ class DashboardServer:
         if self._throttled(ip):
             raise _http(web.HTTPTooManyRequests, "Too many attempts. Wait a few minutes and try again.")
         body = await self._body(request)
-        supplied = str(body.get("token") or "")
-        if not supplied or not hmac.compare_digest(supplied.encode(), self.token.encode()):
+        supplied = body.get("token")
+        if not isinstance(supplied, str) or not supplied or not hmac.compare_digest(supplied.encode(), self.token.encode()):
             self._failures.setdefault(ip, deque()).append(time.time())
             raise _http(web.HTTPUnauthorized, "That dashboard token is not right.")
 
@@ -506,12 +541,12 @@ class DashboardServer:
             self.config,
             guild["id"],
             DASHBOARD_ACTOR,
-            message=str(body.get("message") or ""),
-            title=body.get("title") or None,
+            message=_req_str(body.get("message"), "message"),
+            title=_opt_str(body.get("title"), "title"),
             channel_id=_as_int(body.get("channel_id"), "channel_id"),
             mention_role_id=_as_int(body.get("mention_role_id"), "mention_role_id"),
             publish=_as_bool(body.get("publish")),
-            pin_for=body.get("pin_for") or None,
+            pin_for=_opt_str(body.get("pin_for"), "pin_for"),
         )
         return self._json(result)
 
@@ -534,21 +569,21 @@ class DashboardServer:
             self.config,
             guild["id"],
             DASHBOARD_ACTOR,
-            when=str(body.get("when") or ""),
-            message=str(body.get("message") or ""),
-            title=body.get("title") or None,
+            when=_req_str(body.get("when"), "when"),
+            message=_req_str(body.get("message"), "message"),
+            title=_opt_str(body.get("title"), "title"),
             channel_id=_as_int(body.get("channel_id"), "channel_id"),
             mention_role_id=_as_int(body.get("mention_role_id"), "mention_role_id"),
             publish=_as_bool(body.get("publish")),
-            repeat_every=body.get("repeat_every") or None,
-            pin_for=body.get("pin_for") or None,
+            repeat_every=_opt_str(body.get("repeat_every"), "repeat_every"),
+            pin_for=_opt_str(body.get("pin_for"), "pin_for"),
         )
         return self._json(result, status=201)
 
     async def _scheduled_cancel(self, request: web.Request) -> web.Response:
         self._authed(request)
         guild = await self._guild(request)
-        sid = _as_int(request.match_info["sid"], "id")
+        sid = _require_int(request.match_info["sid"], "id")
         ops.cancel_schedule(guild["id"], DASHBOARD_ACTOR, sid)
         return self._json({"ok": True})
 
@@ -567,9 +602,9 @@ class DashboardServer:
         result = await ops.save_template(
             guild["id"],
             DASHBOARD_ACTOR,
-            name=str(body.get("name") or ""),
-            title=body.get("title") or None,
-            message=str(body.get("message") or ""),
+            name=_req_str(body.get("name"), "name"),
+            title=_opt_str(body.get("title"), "title"),
+            message=_req_str(body.get("message"), "message"),
         )
         return self._json(result)
 
@@ -607,30 +642,35 @@ class DashboardServer:
         self._authed(request)
         guild = await self._guild(request)
         body = await self._body(request)
+        raw_options = body.get("options")
+        if raw_options is None:
+            raw_options = []
+        elif not isinstance(raw_options, (list, str)):
+            raise OperationError("Poll options must be a list or text.")
         result = await ops.create_poll(
             self.gateway,
             self.config,
             guild["id"],
             DASHBOARD_ACTOR,
-            question=str(body.get("question") or ""),
-            options=body.get("options") or [],
+            question=_req_str(body.get("question"), "question"),
+            options=raw_options,
             channel_id=_as_int(body.get("channel_id"), "channel_id"),
-            duration=body.get("duration") or None,
+            duration=_opt_str(body.get("duration"), "duration"),
             multiple=_as_bool(body.get("multiple")),
-            send_at=body.get("send_at") or None,
+            send_at=_opt_str(body.get("send_at"), "send_at"),
         )
         return self._json(result, status=201)
 
     async def _poll_detail(self, request: web.Request) -> web.Response:
         self._authed(request)
         guild = await self._guild(request)
-        pid = _as_int(request.match_info["pid"], "id")
+        pid = _require_int(request.match_info["pid"], "id")
         return self._json(ops.poll_details(guild["id"], pid))
 
     async def _polls_close(self, request: web.Request) -> web.Response:
         self._authed(request)
         guild = await self._guild(request)
-        pid = _as_int(request.match_info["pid"], "id")
+        pid = _require_int(request.match_info["pid"], "id")
         result = await ops.close_poll(self.gateway, self.config, guild["id"], DASHBOARD_ACTOR, pid)
         return self._json(result)
 
@@ -658,7 +698,7 @@ class DashboardServer:
     async def _ticket_close(self, request: web.Request) -> web.Response:
         self._authed(request)
         guild = await self._guild(request)
-        tid = _as_int(request.match_info["tid"], "id")
+        tid = _require_int(request.match_info["tid"], "id")
         result = await ops.close_ticket(
             self.gateway, self.config, guild["id"], DASHBOARD_ACTOR, tid, actor_is_staff=True
         )
@@ -678,9 +718,9 @@ class DashboardServer:
             self.config,
             guild["id"],
             DASHBOARD_ACTOR,
-            message=str(body.get("message") or ""),
-            emoji=str(body.get("emoji") or ""),
-            role_id=_as_int(body.get("role_id"), "role_id"),
+            message=_req_str(body.get("message"), "message"),
+            emoji=_req_str(body.get("emoji"), "emoji"),
+            role_id=_require_int(body.get("role_id"), "role_id", "Choose the role to give."),
             channel_id=_as_int(body.get("channel_id"), "channel_id"),
         )
         return self._json(result, status=201)
@@ -688,7 +728,7 @@ class DashboardServer:
     async def _ticket_transcript(self, request: web.Request) -> web.Response:
         self._authed(request)
         guild = await self._guild(request)
-        tid = _as_int(request.match_info["tid"], "id")
+        tid = _require_int(request.match_info["tid"], "id")
         row = ops.get_ticket_transcript(guild["id"], tid)
         return web.Response(
             text=row["text"],
@@ -711,15 +751,15 @@ class DashboardServer:
             self.config,
             guild["id"],
             DASHBOARD_ACTOR,
-            title=str(body.get("title") or ""),
-            description=str(body.get("description") or ""),
+            title=_req_str(body.get("title"), "title"),
+            description=_req_str(body.get("description"), "description"),
         )
         return self._json(result, status=201)
 
     async def _role_menu_delete(self, request: web.Request) -> web.Response:
         self._authed(request)
         guild = await self._guild(request)
-        mid = _as_int(request.match_info["mid"], "id")
+        mid = _require_int(request.match_info["mid"], "id")
         result = await ops.delete_role_menu(self.gateway, self.config, guild["id"], DASHBOARD_ACTOR, menu_id=mid)
         return self._json(result)
 
@@ -732,10 +772,10 @@ class DashboardServer:
             self.config,
             guild["id"],
             DASHBOARD_ACTOR,
-            menu_id=_as_int(request.match_info["mid"], "id"),
-            role_id=_as_int(body.get("role_id"), "role_id"),
-            label=body.get("label") or None,
-            description=body.get("description") or None,
+            menu_id=_require_int(request.match_info["mid"], "id"),
+            role_id=_require_int(body.get("role_id"), "role_id", "Choose the role to add."),
+            label=_opt_str(body.get("label"), "label"),
+            description=_opt_str(body.get("description"), "description"),
         )
         return self._json(result, status=201)
 
@@ -747,8 +787,8 @@ class DashboardServer:
             self.config,
             guild["id"],
             DASHBOARD_ACTOR,
-            menu_id=_as_int(request.match_info["mid"], "id"),
-            role_id=_as_int(request.match_info["rid"], "id"),
+            menu_id=_require_int(request.match_info["mid"], "id"),
+            role_id=_require_int(request.match_info["rid"], "id"),
         )
         return self._json(result)
 
@@ -761,7 +801,7 @@ class DashboardServer:
             self.config,
             guild["id"],
             DASHBOARD_ACTOR,
-            menu_id=_as_int(request.match_info["mid"], "id"),
+            menu_id=_require_int(request.match_info["mid"], "id"),
             channel_id=_as_int(body.get("channel_id"), "channel_id"),
         )
         return self._json(result, status=201)
@@ -769,7 +809,7 @@ class DashboardServer:
     async def _reaction_role_remove(self, request: web.Request) -> web.Response:
         self._authed(request)
         guild = await self._guild(request)
-        ops.remove_reaction_role(guild["id"], DASHBOARD_ACTOR, _as_int(request.match_info["rid"], "id"))
+        ops.remove_reaction_role(guild["id"], DASHBOARD_ACTOR, _require_int(request.match_info["rid"], "id"))
         return self._json({"ok": True})
 
     async def _events_list(self, request: web.Request) -> web.Response:
@@ -786,9 +826,9 @@ class DashboardServer:
             self.config,
             guild["id"],
             DASHBOARD_ACTOR,
-            title=str(body.get("title") or ""),
-            starts_when=str(body.get("starts_when") or ""),
-            description=str(body.get("description") or ""),
+            title=_req_str(body.get("title"), "title"),
+            starts_when=_req_str(body.get("starts_when"), "starts_when"),
+            description=_req_str(body.get("description"), "description"),
             channel_id=_as_int(body.get("channel_id"), "channel_id"),
             remind_minutes=_as_int(body.get("remind_minutes"), "remind_minutes"),
         )
@@ -797,7 +837,7 @@ class DashboardServer:
     async def _events_cancel(self, request: web.Request) -> web.Response:
         self._authed(request)
         guild = await self._guild(request)
-        eid = _as_int(request.match_info["eid"], "id")
+        eid = _require_int(request.match_info["eid"], "id")
         await ops.cancel_event(self.gateway, self.config, guild["id"], DASHBOARD_ACTOR, eid)
         return self._json({"ok": True})
 
@@ -808,18 +848,30 @@ class DashboardServer:
         self._authed(request)
         guild = await self._guild(request)
         body = await self._body(request)
-        channel_id = _as_int(body.get("channel_id"), "channel_id")
-        if not channel_id:
-            raise OperationError("Choose the channel where welcomes should be posted.")
-        message = body.get("message")
-        result = await ops.set_welcome(
-            self.gateway,
-            self.config,
-            guild["id"],
-            DASHBOARD_ACTOR,
-            channel_id=channel_id,
-            message=None if message is None else str(message),
+        channel_id = _require_int(
+            body.get("channel_id"), "channel_id", "Choose the channel where welcomes should be posted."
         )
+        has_message = "message" in body
+        raw_message = body.get("message")
+        if has_message and raw_message is None:
+            result = await ops.set_welcome(
+                self.gateway,
+                self.config,
+                guild["id"],
+                DASHBOARD_ACTOR,
+                channel_id=channel_id,
+                message=None,
+                clear_message=True,
+            )
+        else:
+            result = await ops.set_welcome(
+                self.gateway,
+                self.config,
+                guild["id"],
+                DASHBOARD_ACTOR,
+                channel_id=channel_id,
+                message=_req_str(raw_message, "message") if has_message else None,
+            )
         return self._json(result)
 
     async def _welcome_off(self, request: web.Request) -> web.Response:
@@ -850,9 +902,9 @@ class DashboardServer:
             self.config,
             guild["id"],
             DASHBOARD_ACTOR,
-            message_id=_as_int(request.match_info["mid"], "message_id"),
-            message=str(body.get("message") or "") if "message" in body else None,
-            title=str(body.get("title") or "") if "title" in body else None,
+            message_id=_require_int(request.match_info["mid"], "message_id"),
+            message=_req_str(body.get("message"), "message") if "message" in body else None,
+            title=_req_str(body.get("title"), "title") if "title" in body else None,
         )
         return self._json(result)
 
@@ -864,7 +916,7 @@ class DashboardServer:
             self.config,
             guild["id"],
             DASHBOARD_ACTOR,
-            message_id=_as_int(request.match_info["mid"], "message_id"),
+            message_id=_require_int(request.match_info["mid"], "message_id"),
         )
         return self._json({"ok": True})
 
@@ -881,14 +933,14 @@ class DashboardServer:
             self.config,
             guild["id"],
             DASHBOARD_ACTOR,
-            _as_int(request.match_info["rid"], "id"),
+            _require_int(request.match_info["rid"], "id"),
         )
         return self._json(result)
 
     async def _approval_reject(self, request: web.Request) -> web.Response:
         self._authed(request)
         guild = await self._guild(request)
-        await ops.reject_request(guild["id"], DASHBOARD_ACTOR, _as_int(request.match_info["rid"], "id"))
+        await ops.reject_request(guild["id"], DASHBOARD_ACTOR, _require_int(request.match_info["rid"], "id"))
         return self._json({"ok": True})
 
     async def _audit_csv(self, request: web.Request) -> web.Response:

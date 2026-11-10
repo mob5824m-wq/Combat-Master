@@ -36,8 +36,8 @@ def parse_emoji(text: Optional[str]) -> str:
         raise ValueError("That does not look like an emoji.")
     if CUSTOM_EMOJI.fullmatch(cleaned):
         return cleaned
-    # A standard emoji is never plain text: reject anything made of ASCII letters or digits.
-    if cleaned.isascii() and any(ch.isalnum() for ch in cleaned):
+    # A standard Unicode emoji always contains non-ASCII codepoints; reject ASCII text/punctuation.
+    if cleaned.isascii():
         raise ValueError(
             "That is not an emoji. Use a standard emoji, or a server emoji written as <:name:id>."
         )

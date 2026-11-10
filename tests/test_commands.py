@@ -468,10 +468,38 @@ class CommandFeatureTests(unittest.TestCase):
         self.assertIn("Posts made by hand wait too.", set_up.followup.last_text)
         self.assertTrue(settings.get_quiet_hold_manual(bot_module.bot.config, GUILD))
 
+        only_start = self.ada()
+        self.call("manage_quiet", only_start, start="23:00", end=None, hold_manual=None)
+        self.assertEqual(settings.get_quiet_hours(bot_module.bot.config, GUILD), ("23:00", "08:00"))
+
+        only_end = self.ada()
+        self.call("manage_quiet", only_end, start=None, end="09:00", hold_manual=None)
+        self.assertEqual(settings.get_quiet_hours(bot_module.bot.config, GUILD), ("23:00", "09:00"))
+
         only_flag = self.ada()
         self.call("manage_quiet", only_flag, start=None, end=None, hold_manual=False)
         self.assertFalse(settings.get_quiet_hold_manual(bot_module.bot.config, GUILD))
-        self.assertEqual(settings.get_quiet_hours(bot_module.bot.config, GUILD), ("22:00", "08:00"))
+        self.assertEqual(settings.get_quiet_hours(bot_module.bot.config, GUILD), ("23:00", "09:00"))
+
+    def test_template_use_during_quiet_hours_hold_reports_held_schedule(self):
+        save = self.ada()
+        self.call("template_save", save, name="night", message="Reminder", title=None)
+        settings.set_guild_value(self.cfg, GUILD, "quiet_start", "00:00")
+        settings.set_guild_value(self.cfg, GUILD, "quiet_end", "23:59")
+        settings.set_guild_value(self.cfg, GUILD, "quiet_hold_manual", True)
+
+        used = self.ada()
+        self.call("template_use", used, name="night", channel=None, mention=None, publish=False)
+        self.assertIn("Quiet hours are on, so this is held", used.followup.last_text)
+        self.assertNotIn(": None", used.followup.last_text)
+
+    def test_fit_lines_and_cli_port_validation(self):
+        long_lines = [f"Entry {i}: " + ("x" * 200) for i in range(25)]
+        fitted = bot_module._fit_lines(long_lines, limit=1950)
+        self.assertLessEqual(len(fitted), 1950)
+        self.assertIn("...and ", fitted)
+        self.assertEqual(bot_module.main(["--demo", "--port", "0"]), 1)
+        self.assertEqual(bot_module.main(["--demo", "--port=bad"]), 1)
 
     def test_outsiders_cannot_use_the_new_commands(self):
         outsider = fake_interaction(user_id=77, name="Eve")

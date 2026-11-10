@@ -141,7 +141,7 @@ class CombatMasterBot(commands.Bot):
                 self.config,
                 token=token,
                 host=host,
-                port=int(self.config.get("dashboard_port") or 8765),
+                port=int(self.config.get("dashboard_port") or settings.DEFAULT_DASHBOARD_PORT),
                 allowed_hosts=self.config.get("dashboard_allowed_hosts") or [],
                 trusted_proxies=self.config.get("dashboard_trusted_proxies") or [],
                 secure_cookie=bool(self.config.get("dashboard_secure_cookie")),
@@ -280,6 +280,25 @@ def _when_text(iso: str) -> str:
 
 def _warn_lines(warnings: list[str]) -> list[str]:
     return [f"⚠️ {w}" for w in warnings]
+
+
+def _fit_lines(lines: list[str], *, limit: int = 1950) -> str:
+    """Join lines so the reply never exceeds Discord's message or embed length limit."""
+    out: list[str] = []
+    used = 0
+    for idx, line in enumerate(lines):
+        remaining = len(lines) - idx
+        suffix = f"\n...and {remaining} more." if remaining > 1 else ""
+        step = (1 if out else 0) + len(line)
+        if used + step + len(suffix) <= limit:
+            out.append(line)
+            used += step
+            continue
+        if not out:
+            return line[: max(0, limit - 3)] + "..."
+        out.append(f"...and {remaining} more.")
+        break
+    return "\n".join(out)
 
 
 def _held_text(result: dict[str, Any]) -> str:
@@ -531,7 +550,7 @@ class CombatMasterCog(commands.Cog):
             )
         if len(pending) > 25:
             lines.append(f"...and {len(pending) - 25} more.")
-        embed = discord.Embed(title="Scheduled announcements", description="\n".join(lines), color=ann.EMBED_COLOR)
+        embed = discord.Embed(title="Scheduled announcements", description=_fit_lines(lines, limit=4000), color=ann.EMBED_COLOR)
         await self._reply(interaction, embed=embed)
 
     @manage_group.command(name="cancel", description="Cancel a scheduled or repeating announcement.")
@@ -568,7 +587,7 @@ class CombatMasterCog(commands.Cog):
             lines.append(
                 f"{_when_text(row['created_at'])} · {how} in <#{row['channel_id']}> · **{row['title']}**{jump}"
             )
-        embed = discord.Embed(title="Recent announcements", description="\n".join(lines), color=ann.EMBED_COLOR)
+        embed = discord.Embed(title="Recent announcements", description=_fit_lines(lines, limit=4000), color=ann.EMBED_COLOR)
         await self._reply(interaction, embed=embed)
 
     # ================================================================== #
@@ -607,8 +626,10 @@ class CombatMasterCog(commands.Cog):
         if not rows:
             await self._reply(interaction, "No templates yet. Save one with `/manage template save`.")
             return
-        lines = [f"`{row['name']}` · {row['title']}" for row in rows]
-        await self._reply(interaction, "\n".join(lines[:50]))
+        lines = [f"`{row['name']}` · {row['title']}" for row in rows[:50]]
+        if len(rows) > 50:
+            lines.append(f"...and {len(rows) - 50} more.")
+        await self._reply(interaction, _fit_lines(lines))
 
     @template_group.command(name="delete", description="Delete a saved template.")
     @app_commands.describe(name="The template's name.")
@@ -656,6 +677,9 @@ class CombatMasterCog(commands.Cog):
         if result.get("queued"):
             await self._reply(interaction, _queued_text(result))
             return
+        if result.get("held"):
+            await self._reply(interaction, _held_text(result))
+            return
         await self._reply(
             interaction,
             "\n".join([f"Posted template `{name}` in <#{result['channel_id']}>: {result['jump_url']}"]
@@ -678,7 +702,7 @@ class CombatMasterCog(commands.Cog):
         self,
         interaction: discord.Interaction,
         question: app_commands.Range[str, 1, polls.MAX_QUESTION_LENGTH],
-        options: app_commands.Range[str, 1, 1000],
+        options: app_commands.Range[str, 1, 1200],
         duration: Optional[app_commands.Range[str, 1, 20]] = None,
         channel: Optional[discord.TextChannel] = None,
         multiple: bool = False,
@@ -725,7 +749,7 @@ class CombatMasterCog(commands.Cog):
             f"**#{row['id']}** · {row['status']} · {row['question']} · <#{row['channel_id']}>"
             for row in rows[:25]
         ]
-        await self._reply(interaction, "\n".join(lines))
+        await self._reply(interaction, _fit_lines(lines))
 
     # ================================================================== #
     # Tickets
@@ -760,7 +784,7 @@ class CombatMasterCog(commands.Cog):
             f"**#{row['id']}** · <#{row['channel_id']}> · {row['opener_name'] or 'a member'} · {_when_text(row['created_at'])}"
             for row in rows[:25]
         ]
-        await self._reply(interaction, "\n".join(lines))
+        await self._reply(interaction, _fit_lines(lines))
 
     @ticket_group.command(name="close", description="Close a ticket and delete its channel.")
     @app_commands.describe(ticket_id="The ticket's number. Leave it out when you are inside the ticket.")
@@ -842,7 +866,7 @@ class CombatMasterCog(commands.Cog):
             f"**#{row['id']}** · {row['emoji']} · <@&{row['role_id']}> · message {row['message_id']} in <#{row['channel_id']}>"
             for row in rows[:25]
         ]
-        await self._reply(interaction, "\n".join(lines))
+        await self._reply(interaction, _fit_lines(lines))
 
     @reaction_role_group.command(name="remove", description="Stop an emoji giving a role. Roles already given stay.")
     @app_commands.describe(rule_id="The number shown by /manage reactionrole list.")
@@ -983,7 +1007,7 @@ class CombatMasterCog(commands.Cog):
         for row in rows[:25]:
             where = f"posted in <#{row['channel_id']}>" if row["message_id"] else "not posted"
             lines.append(f"**#{row['id']}** · {row['title']} · {len(row['options'])} role(s) · {where}")
-        await self._reply(interaction, "\n".join(lines))
+        await self._reply(interaction, _fit_lines(lines))
 
     @role_menu_group.command(name="delete", description="Delete a role menu and its message.")
     @app_commands.describe(menu_id="The number of the menu.")
@@ -1072,7 +1096,7 @@ class CombatMasterCog(commands.Cog):
         for row in rows[:25]:
             going = "?" if row["going"] is None else str(row["going"])
             lines.append(f"**#{row['id']}** · {row['title']} · {_when_text(row['starts_at'])} · going: {going}")
-        await self._reply(interaction, "\n".join(lines))
+        await self._reply(interaction, _fit_lines(lines))
 
     @event_group.command(name="cancel", description="Cancel an upcoming event.")
     @app_commands.describe(event_id="The number shown by /manage event list.")
@@ -1179,8 +1203,8 @@ class CombatMasterCog(commands.Cog):
             inline=True,
         )
         quiet_start, quiet_end = settings.get_quiet_hours(self.bot.config, guild_id)
-        quiet_text = f"{quiet_start} to {quiet_end}" if quiet_start else "Off"
-        if quiet_start and settings.get_quiet_hold_manual(self.bot.config, guild_id):
+        quiet_text = f"{quiet_start} to {quiet_end}" if (quiet_start and quiet_end) else "Off"
+        if quiet_start and quiet_end and settings.get_quiet_hold_manual(self.bot.config, guild_id):
             quiet_text += " · holds posts by hand too"
         embed.add_field(name="Quiet hours", value=quiet_text, inline=True)
         embed.add_field(name="Pinned", value=str(data["pins_active"]), inline=True)
@@ -1199,7 +1223,7 @@ class CombatMasterCog(commands.Cog):
             f"{_when_text(row['created_at'])} · **{row['actor_name']}** ({row['source']}) · `{row['action']}` {row['detail']}"
             for row in rows
         ]
-        embed = discord.Embed(title="Recent staff actions", description="\n".join(lines)[:4000], color=ann.EMBED_COLOR)
+        embed = discord.Embed(title="Recent staff actions", description=_fit_lines(lines, limit=4000), color=ann.EMBED_COLOR)
         await self._reply(interaction, embed=embed)
 
     # ================================================================== #
@@ -1220,7 +1244,7 @@ class CombatMasterCog(commands.Cog):
         ]
         if len(pending) > 25:
             lines.append(f"...and {len(pending) - 25} more.")
-        embed = discord.Embed(title="Waiting for approval", description="\n".join(lines)[:4000], color=ann.EMBED_COLOR)
+        embed = discord.Embed(title="Waiting for approval", description=_fit_lines(lines, limit=4000), color=ann.EMBED_COLOR)
         embed.set_footer(text="Approve with /manage approve, or turn one down with /manage reject.")
         await self._reply(interaction, embed=embed)
 
@@ -1337,10 +1361,15 @@ class CombatMasterCog(commands.Cog):
             await self._reply(interaction, text)
             return
         changes: dict[str, Any] = {}
-        if start is not None and start.strip().lower() == "off":
+        if start is not None and start.strip().lower() == "off" and end is None:
+            changes.update({"quiet_start": None, "quiet_end": None})
+        elif end is not None and end.strip().lower() == "off" and start is None:
             changes.update({"quiet_start": None, "quiet_end": None})
         elif start is not None or end is not None:
-            changes.update({"quiet_start": start, "quiet_end": end})
+            if start is not None:
+                changes["quiet_start"] = start
+            if end is not None:
+                changes["quiet_end"] = end
         if hold_manual is not None:
             changes["quiet_hold_manual"] = hold_manual
         try:
@@ -1375,10 +1404,13 @@ class CombatMasterCog(commands.Cog):
         ]
         if len(rows) > 25:
             lines.append(f"...and {len(rows) - 25} more.")
-        embed = discord.Embed(title="Pinned posts", description="\n".join(lines)[:4000], color=ann.EMBED_COLOR)
+        embed = discord.Embed(title="Pinned posts", description=_fit_lines(lines, limit=4000), color=ann.EMBED_COLOR)
         await self._reply(interaction, embed=embed)
 
-    @manage_group.command(name="setup", description="Set the staff role, channels, timezone and dashboard links.")
+    @manage_group.command(
+        name="setup",
+        description="Set the staff role, channels, timezone, approval and ticket category.",
+    )
     @app_commands.describe(
         staff_role="Members with this role can run /manage commands.",
         announcement_channel="Default channel for announcements, polls and events.",
@@ -1543,6 +1575,10 @@ def _help() -> str:
 
 
 def _option(args: list[str], name: str, default: str) -> str:
+    prefix = f"{name}="
+    for arg in args:
+        if arg.startswith(prefix):
+            return arg[len(prefix) :]
     if name in args:
         index = args.index(name)
         if index + 1 < len(args):
@@ -1565,7 +1601,15 @@ def main(argv: Optional[list[str]] = None) -> int:
         from demo import run_demo
 
         host = _option(args, "--host", "127.0.0.1")
-        port = int(_option(args, "--port", "8765"))
+        raw_port = _option(args, "--port", str(settings.DEFAULT_DASHBOARD_PORT))
+        try:
+            port = int(raw_port)
+        except ValueError:
+            print(f"Invalid --port value {raw_port!r}: must be a number between 1 and 65535.", file=sys.stderr)
+            return 1
+        if not 1 <= port <= 65535:
+            print(f"Invalid --port value {port}: must be between 1 and 65535.", file=sys.stderr)
+            return 1
         try:
             asyncio.run(run_demo(host, port))
         except KeyboardInterrupt:
@@ -1584,7 +1628,8 @@ def main(argv: Optional[list[str]] = None) -> int:
         token = resolve_token(bot.config)
         print("Token: " + ("set" if token else "MISSING (set DISCORD_TOKEN or bot_token)"))
         print(f"Dashboard: {'enabled' if bot.config.get('dashboard_enabled', True) else 'disabled'} on "
-              f"{bot.config.get('dashboard_host')}:{bot.config.get('dashboard_port')}")
+              f"{bot.config.get('dashboard_host') or '127.0.0.1'}:"
+              f"{bot.config.get('dashboard_port') or settings.DEFAULT_DASHBOARD_PORT}")
         print(f"Configured servers: {len(bot.config.get('guilds') or {})}")
         return 0 if token else 1
 

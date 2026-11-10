@@ -179,8 +179,16 @@
   // Login, session, servers
   // ------------------------------------------------------------------ //
   function showLogin() {
+    stopPollRefresh();
+    closeEdit();
     state.csrf = null;
     state.guildId = null;
+    state.snapshot = null;
+    state.settings = null;
+    state.templateName = null;
+    state.pollDetailId = null;
+    $("#template-use-form").hidden = true;
+    $("#poll-detail").hidden = true;
     $("#app-view").hidden = true;
     $("#logout-btn").hidden = true;
     $("#guild-select").replaceChildren();
@@ -259,6 +267,9 @@
   async function selectGuild(guildId) {
     state.guildId = String(guildId);
     state.pollDetailId = null;
+    state.templateName = null;
+    closeEdit();
+    $("#template-use-form").hidden = true;
     $("#poll-detail").hidden = true;
     $("#guild-select").value = state.guildId;
     try {
@@ -291,6 +302,7 @@
   function blankLabel(form, kind) {
     const id = form ? form.id : "";
     if (id === "welcome-form") return "Choose a channel";
+    if (id === "role-form" && kind === "role") return "Choose a role";
     if (id === "settings-form") return "Not set";
     return kind === "role" ? "No role" : "Server default";
   }
@@ -449,7 +461,10 @@
       remove.addEventListener("click", () => {
         if (!window.confirm(`Delete “${row.title}” from Discord? This can not be undone.`)) return;
         runAction(remove, () => api(`guilds/${state.guildId}/announcements/${row.message_id}`, { method: "DELETE" }),
-          "Deleted the announcement.", refreshTab);
+          "Deleted the announcement.", async () => {
+            if ($("#edit-form").elements.message_id.value === String(row.message_id)) closeEdit();
+            await refreshTab();
+          });
       });
       buttons.push(edit, remove);
     }
@@ -586,7 +601,7 @@
   function pinRow(row) {
     return el("li", {}, [
       el("div", { class: "grow" }, [
-        el("strong", { text: `Pinned post in channel ${row.channel_id}` }),
+        el("strong", { text: `Pinned post in ${channelName(row.channel_id)}` }),
         el("div", { class: "meta", text: `unpins ${fmtTime(row.unpin_at)}` }),
       ]),
     ]);
@@ -626,9 +641,17 @@
   function approvalRow(row) {
     const approve = el("button", { type: "button", class: "small", text: "Approve" });
     approve.addEventListener("click", () => {
-      if (!window.confirm(`Approve #${row.id} and send it now?`)) return;
+      const prompt = row.kind === "schedule"
+        ? `Approve scheduled #${row.id}?`
+        : `Approve #${row.id} and send it now?`;
+      if (!window.confirm(prompt)) return;
       runAction(approve, () => api(`guilds/${state.guildId}/approvals/${row.id}/approve`, { method: "POST" }),
-        (r) => (r.held ? heldNotice(r) : r.jump_url ? `Approved and posted: ${r.jump_url}` : `Approved #${row.id}.`), loadApprovals);
+        (r) => (r.held
+          ? withWarnings(heldNotice(r), r)
+          : r.jump_url
+            ? withWarnings(`Approved and posted: ${r.jump_url}`, r)
+            : withWarnings(`Approved #${row.id}${r.send_at ? ` for ${fmtTime(r.send_at)}` : ""}.`, r)),
+        loadApprovals);
     });
     const reject = el("button", { type: "button", class: "danger small", text: "Reject" });
     reject.addEventListener("click", () => {
@@ -681,7 +704,13 @@
     deleteButton.addEventListener("click", () => {
       if (!window.confirm(`Delete template “${row.name}”?`)) return;
       runAction(deleteButton, () => api(`guilds/${state.guildId}/templates/${encodeURIComponent(row.name)}`, { method: "DELETE" }),
-        `Deleted template “${row.name}”.`, loadTemplates);
+        `Deleted template “${row.name}”.`, async () => {
+          if (state.templateName === row.name) {
+            $("#template-use-form").hidden = true;
+            state.templateName = null;
+          }
+          await loadTemplates();
+        });
     });
     return el("li", {}, [
       el("div", { class: "grow" }, [
@@ -723,7 +752,9 @@
           publish: f.has("publish"),
         },
       }),
-      (r) => withWarnings(`Posted “${name}”${r.jump_url ? `: ${r.jump_url}` : "."}`, r),
+      (r) => (r.queued ? approvalNotice(r) : r.held ? withWarnings(heldNotice(r), r) : withWarnings(
+        `Posted “${name}”${r.jump_url ? `: ${r.jump_url}` : "."}`, r,
+      )),
       () => { form.reset(); form.hidden = true; state.templateName = null; fillSelects(); },
     );
   });
@@ -796,7 +827,7 @@
           button,
           () => api(`guilds/${state.guildId}/polls/${row.id}/close`, { method: "POST" }),
           (r) => (r.cancelled ? `Cancelled scheduled poll #${r.id}.` : `Closed poll #${r.id}: ${r.question}`),
-          loadPolls,
+          async () => { await loadPolls(); await loadPollDetail(); },
         );
       });
       children.push(button);
@@ -830,9 +861,17 @@
       ? counts.reduce((sum, n) => sum + n, 0)
       : poll.voters_count;
     $("#poll-detail-title").textContent = `#${poll.id} · ${poll.question}`;
-    $("#poll-detail-live").textContent = poll.status === "open"
-      ? `Live · ${total} voter(s) · refreshes every few seconds`
-      : `Final · ${total} voter(s)`;
+    let liveText = `Final · ${total} voter(s)`;
+    if (poll.status === "open") {
+      liveText = `Live · ${total} voter(s) · refreshes every few seconds`;
+    } else if (poll.status === "scheduled") {
+      liveText = poll.send_at ? `Scheduled · posts ${fmtTime(poll.send_at)}` : "Scheduled";
+    } else if (poll.status === "cancelled") {
+      liveText = "Cancelled";
+    } else if (poll.status === "failed") {
+      liveText = "Failed to post";
+    }
+    $("#poll-detail-live").textContent = liveText;
     const rows = options.map((option, i) => {
       const count = counts[i] ?? 0;
       const share = total ? Math.round((100 * count) / total) : 0;
@@ -1079,6 +1118,9 @@
     });
 
     const channelSelect = menuSelect("channel");
+    if (menu.channel_id && Array.from(channelSelect.options).some((o) => o.value === String(menu.channel_id))) {
+      channelSelect.value = String(menu.channel_id);
+    }
     const post = el("button", { type: "button", class: "small", text: menu.message_id ? "Post again" : "Post menu" });
     post.addEventListener("click", () => {
       if (options.length === 0) return notice("Add at least one role before posting.", "err");
@@ -1177,7 +1219,7 @@
       form,
       () => api(`guilds/${state.guildId}/welcome`, {
         method: "POST",
-        body: { channel_id: opt(f, "channel_id"), message: f.get("message") ?? "" },
+        body: { channel_id: opt(f, "channel_id"), message: opt(f, "message") },
       }),
       "Welcome messages saved.",
       reloadSettings,
@@ -1234,7 +1276,7 @@
   // ------------------------------------------------------------------ //
   // Audit log
   // ------------------------------------------------------------------ //
-  $("#audit-refresh").addEventListener("click", () => loadAudit());
+  $("#audit-refresh").addEventListener("click", () => runAction($("#audit-refresh"), () => loadAudit()));
 
   $("#audit-export").addEventListener("click", (event) => {
     runAction(event.currentTarget, async () => {
